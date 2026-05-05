@@ -65,6 +65,46 @@ def _stack_logged_signal(logs: dict, sig: str) -> np.ndarray:
     return data
 
 
+def _series_from_signal(logs: dict, sig: str) -> list[tuple[str, np.ndarray]]:
+    """Return flat (label, values) series for one signal."""
+    data = _stack_logged_signal(logs, sig)
+    m, n = data.shape[1], data.shape[2]
+
+    if (m, n) == (1, 1):
+        return [(sig, data[:, 0, 0])]
+
+    if n == 1:
+        return [(f"{sig}[{i}]", data[:, i, 0]) for i in range(m)]
+
+    return [(f"{sig}[{r},{c}]", data[:, r, c]) for r in range(m) for c in range(n)]
+
+
+def _resolve_plot_mode(plot: dict, total_series: int, signal_count: int) -> str:
+    """Resolve plot mode with safe defaults."""
+    mode = str(plot.get("mode", "auto")).strip().lower()
+    if mode in {"overlay", "split_signals", "split_components"}:
+        return mode
+    if mode != "auto":
+        return "overlay"
+
+    # Simulink-like readability: split automatically when too many curves.
+    if total_series > 6:
+        return "split_components"
+    if signal_count > 2:
+        return "split_signals"
+    return "overlay"
+
+
+def _style_axes(ax: plt.Axes, title: str, show_legend: bool) -> None:
+    """Apply consistent axis style."""
+    ax.set_xlabel("Time [s]")
+    ax.grid(True)
+    if title:
+        ax.set_title(title)
+    if show_legend and ax.lines:
+        ax.legend()
+
+
 def plot_from_config(
     logs: dict,
     plot_cfg: PlotConfig | None,
@@ -121,38 +161,52 @@ def plot_from_config(
     for plot in plot_cfg.plots:
         title = plot.get("title", "")
         signals = plot["signals"]
-
-        plt.figure()
+        series_by_signal: list[tuple[str, list[tuple[str, np.ndarray]]]] = []
 
         for sig in signals:
             data = _stack_logged_signal(logs, sig)
-
             if data.shape[0] != T:
                 raise ValueError(
                     f"Time length mismatch for '{sig}': time has {T} samples but signal has {data.shape[0]}."
                 )
+            series_by_signal.append((sig, _series_from_signal(logs, sig)))
 
-            m, n = data.shape[1], data.shape[2]
+        flat_series = [
+            (sig, label, values)
+            for sig, sig_series in series_by_signal
+            for label, values in sig_series
+        ]
+        mode = _resolve_plot_mode(plot, total_series=len(flat_series), signal_count=len(signals))
 
-            if (m, n) == (1, 1):
-                plt.step(time, data[:, 0, 0], where="post", label=sig)
-                continue
+        if mode == "overlay":
+            fig, ax = plt.subplots()
+            for _, label, values in flat_series:
+                ax.step(time, values, where="post", label=label)
+            _style_axes(ax, title, show_legend=True)
+            fig.tight_layout()
+            continue
 
-            if n == 1:
-                for i in range(m):
-                    plt.step(time, data[:, i, 0], where="post", label=f"{sig}[{i}]")
-                continue
+        if mode == "split_signals":
+            fig, axes = plt.subplots(len(series_by_signal), 1, sharex=True, squeeze=False)
+            axes_1d = axes.flatten()
+            for i, (sig, sig_series) in enumerate(series_by_signal):
+                ax = axes_1d[i]
+                for label, values in sig_series:
+                    ax.step(time, values, where="post", label=label)
+                panel_title = f"{title} - {sig}" if title else sig
+                _style_axes(ax, panel_title, show_legend=True)
+            fig.tight_layout()
+            continue
 
-            for r in range(m):
-                for c in range(n):
-                    plt.step(time, data[:, r, c], where="post", label=f"{sig}[{r},{c}]")
-
-        plt.xlabel("Time [s]")
-        plt.grid(True)
-        plt.legend()
-
-        if title:
-            plt.title(title)
+        # split_components
+        fig, axes = plt.subplots(len(flat_series), 1, sharex=True, squeeze=False)
+        axes_1d = axes.flatten()
+        for i, (_, label, values) in enumerate(flat_series):
+            ax = axes_1d[i]
+            ax.step(time, values, where="post", label=label)
+            panel_title = f"{title} - {label}" if title else label
+            _style_axes(ax, panel_title, show_legend=False)
+        fig.tight_layout()
 
     if show:
         plt.show(block=block)
