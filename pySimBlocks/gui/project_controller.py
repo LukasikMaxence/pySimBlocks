@@ -344,22 +344,25 @@ class ProjectController(QObject):
     # Plot methods
     # --------------------------------------------------------------------------
 
-    def create_plot(self, title: str, signals: list[str]) -> None:
+    def create_plot(self, title: str, signals: list[str], mode: str = "auto") -> None:
         """Append a new plot to the project configuration.
 
         Args:
             title: Title of the plot figure.
             signals: List of signal names to display in the plot. Any signal
                 not already logged is automatically added to the logging list.
+            mode: Plot display mode (``auto``, ``overlay``, ``split_signals``,
+                or ``split_components``).
         """
         self._ensure_logged(signals)
         self.project_state.plots.append({
             "title": title,
             "signals": list(signals),
+            "mode": mode,
         })
         self.make_dirty()
 
-    def update_plot(self, index: int, title: str, signals: list[str]) -> None:
+    def update_plot(self, index: int, title: str, signals: list[str], mode: str = "auto") -> None:
         """Update the title and signals of an existing plot.
 
         Args:
@@ -367,13 +370,20 @@ class ProjectController(QObject):
             title: New title for the plot.
             signals: New list of signal names. Any signal not yet logged is
                 automatically added.
+            mode: Plot display mode (``auto``, ``overlay``, ``split_signals``,
+                or ``split_components``).
         """
         self._ensure_logged(signals)
         plot = self.project_state.plots[index]
-        if plot["signals"] == signals and plot["title"] == title:
+        if (
+            plot["signals"] == signals
+            and plot["title"] == title
+            and str(plot.get("mode", "auto")) == mode
+        ):
             return
         plot["title"] = title
         plot["signals"] = list(signals)
+        plot["mode"] = mode
         self.make_dirty()
 
     def delete_plot(self, index: int) -> None:
