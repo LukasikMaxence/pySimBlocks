@@ -190,7 +190,8 @@ class ToolBarView(QToolBar):
                 QMessageBox.Ok,
             )
             return
-        self._plot_dialog = PlotDialog(self.project_controller.project_state, self.parent())  # keep ref because of python garbage collector
+        # Open as an independent top-level window so fullscreen works reliably.
+        self._plot_dialog = PlotDialog(self.project_controller.project_state, None)  # keep ref because of python garbage collector
         self._plot_dialog.show()
 
     def set_running(self, running: bool) -> None:

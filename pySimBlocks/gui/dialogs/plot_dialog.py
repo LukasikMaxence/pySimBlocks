@@ -23,12 +23,13 @@ import matplotlib.pyplot as plt
 
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout,
-    QLabel, QListWidget, QListWidgetItem,
-    QPushButton, QSizePolicy, QMessageBox
+    QLabel, QTreeWidget, QTreeWidgetItem,
+    QPushButton, QSizePolicy, QMessageBox, QComboBox, QToolButton, QMenu, QCheckBox
 )
 from PySide6.QtCore import Qt
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 
 from pySimBlocks.gui.models.project_state import ProjectState
@@ -41,7 +42,7 @@ class PlotDialog(QDialog):
 
     Attributes:
         project_state: Project state providing logs and plot definitions.
-        selected_signals: Signals currently selected for preview.
+        signal tree selection: Checked signals/components for manual preview.
     """
 
     def __init__(self, project_state: ProjectState, parent=None):
@@ -57,12 +58,20 @@ class PlotDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Plot signals")
         self.resize(900, 500)
+        self.setWindowFlag(Qt.Window, True)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
 
         self.project_state = project_state
-        self.selected_signals: set[str] = set()
+        self._subplot_items: list[tuple[str, str]] = []
+        self._subplot_actions: dict[str, object] = {}
+        self._updating_signal_tree = False
+        self._focused_panel_key: str | None = None
+        self._axis_to_panel_key: dict[int, str] = {}
 
         self._build_ui()
         self._populate_signals()
+        self._populate_plot_presets()
 
     # --------------------------------------------------------------------------
     # Private Methods
@@ -74,13 +83,31 @@ class PlotDialog(QDialog):
         # ---------- Left panel ----------
         left_layout = QVBoxLayout()
 
+        self.multi_preset_cb = QCheckBox("Multi-plot view")
+        self.multi_preset_cb.setChecked(False)
+        self.multi_preset_cb.stateChanged.connect(self._on_multi_mode_changed)
+        left_layout.addWidget(self.multi_preset_cb)
+
         title = QLabel("<b>Signals (logged)</b>")
         left_layout.addWidget(title)
 
-        self.signal_list = QListWidget()
-        self.signal_list.setSelectionMode(QListWidget.NoSelection)
-        self.signal_list.itemChanged.connect(self._on_signal_toggled)
-        left_layout.addWidget(self.signal_list)
+        self.signal_tree = QTreeWidget()
+        self.signal_tree.setHeaderHidden(True)
+        self.signal_tree.itemChanged.connect(self._on_signal_toggled)
+        left_layout.addWidget(self.signal_tree)
+
+        left_layout.addWidget(QLabel("<b>Plot preset</b>"))
+        self.plot_preset_combo = QComboBox()
+        self.plot_preset_combo.currentIndexChanged.connect(self._on_plot_preset_changed)
+        left_layout.addWidget(self.plot_preset_combo)
+
+        left_layout.addWidget(QLabel("<b>Subplots filter</b>"))
+        self.subplot_menu_btn = QToolButton()
+        self.subplot_menu_btn.setText("Select subplots")
+        self.subplot_menu_btn.setPopupMode(QToolButton.InstantPopup)
+        self.subplot_menu = QMenu(self.subplot_menu_btn)
+        self.subplot_menu_btn.setMenu(self.subplot_menu)
+        left_layout.addWidget(self.subplot_menu_btn)
 
         self.plot_defined_btn = QPushButton("Plot defined plots")
         self.plot_defined_btn.clicked.connect(self._plot_defined_plots)
@@ -92,32 +119,175 @@ class PlotDialog(QDialog):
         self.figure = Figure()
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+        self.nav_toolbar = NavigationToolbar2QT(self.canvas, self)
 
-        main_layout.addWidget(self.canvas, 1)
+        right_layout = QVBoxLayout()
+        controls_layout = QHBoxLayout()
+        self.grid_cb = QCheckBox("Grid")
+        self.grid_cb.setChecked(True)
+        self.grid_cb.stateChanged.connect(self._update_preview_plot)
+        self.legend_cb = QCheckBox("Legend")
+        self.legend_cb.setChecked(True)
+        self.legend_cb.stateChanged.connect(self._update_preview_plot)
+        self.autoscale_btn = QPushButton("Autoscale")
+        self.autoscale_btn.clicked.connect(self._autoscale_preview)
+        controls_layout.addWidget(self.grid_cb)
+        controls_layout.addWidget(self.legend_cb)
+        controls_layout.addWidget(self.autoscale_btn)
+        controls_layout.addStretch(1)
+
+        right_layout.addLayout(controls_layout)
+        right_layout.addWidget(self.nav_toolbar)
+        right_layout.addWidget(self.canvas, 1)
+        main_layout.addLayout(right_layout, 1)
 
     def _populate_signals(self):
         """Populate the signal list from the available logged signals."""
-        self.signal_list.clear()
+        self.signal_tree.clear()
+        self._updating_signal_tree = True
+        try:
+            for sig in sorted(self.project_state.logs.keys()):
+                if sig == "time":
+                    continue
 
-        for sig in sorted(self.project_state.logs.keys()):
-            if sig == "time":
-                continue
+                parent = QTreeWidgetItem([sig])
+                parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable)
+                parent.setCheckState(0, Qt.Unchecked)
+                parent.setData(0, Qt.UserRole, ("signal", sig))
+                self.signal_tree.addTopLevelItem(parent)
 
-            item = QListWidgetItem(sig)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
-            self.signal_list.addItem(item)
+                for label in self._component_labels_for_signal(sig):
+                    child = QTreeWidgetItem([f"   {label}"])
+                    child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+                    child.setCheckState(0, Qt.Unchecked)
+                    child.setData(0, Qt.UserRole, ("component", sig, label))
+                    parent.addChild(child)
+        finally:
+            self._updating_signal_tree = False
 
-    def _on_signal_toggled(self, item: QListWidgetItem):
-        """Update the selected signal set when a checkbox changes."""
-        sig = item.text()
-
-        if item.checkState() == Qt.Checked:
-            self.selected_signals.add(sig)
-        else:
-            self.selected_signals.discard(sig)
-
+    def _on_signal_toggled(self, _item: QTreeWidgetItem, _column: int):
+        """Redraw preview when signal/component check states change."""
+        if self._updating_signal_tree:
+            return
+        self._updating_signal_tree = True
+        try:
+            data = _item.data(0, Qt.UserRole)
+            if isinstance(data, tuple) and len(data) >= 2 and data[0] == "signal":
+                # Parent toggled: apply state to all child components.
+                for i in range(_item.childCount()):
+                    _item.child(i).setCheckState(0, _item.checkState(0))
+            elif isinstance(data, tuple) and len(data) == 3 and data[0] == "component":
+                # Child toggled: keep parent check state in sync.
+                parent = _item.parent()
+                if parent is not None:
+                    checked = 0
+                    for i in range(parent.childCount()):
+                        if parent.child(i).checkState(0) == Qt.Checked:
+                            checked += 1
+                    if checked == 0:
+                        parent.setCheckState(0, Qt.Unchecked)
+                    elif checked == parent.childCount():
+                        parent.setCheckState(0, Qt.Checked)
+        finally:
+            self._updating_signal_tree = False
         self._update_preview_plot()
+
+    def _on_plot_preset_changed(self, _index: int):
+        """Handle plot preset selection changes."""
+        if self.multi_preset_cb.isChecked():
+            self._update_preview_plot()
+            return
+        is_manual = self._selected_preset_index() is None
+        self.signal_tree.setEnabled(is_manual)
+        self.subplot_menu_btn.setEnabled(not is_manual)
+        self._update_preview_plot()
+
+    def _on_multi_mode_changed(self, _state: int):
+        """Enable/disable multi-plot mode."""
+        is_multi = self.multi_preset_cb.isChecked()
+        self.plot_preset_combo.setEnabled(not is_multi)
+        if is_multi:
+            self.signal_tree.setEnabled(True)
+        else:
+            self.signal_tree.setEnabled(self._selected_preset_index() is None)
+        self.subplot_menu_btn.setEnabled(not is_multi and self._selected_preset_index() is not None)
+        self._update_preview_plot()
+
+    def _on_subplot_toggled(self, _checked: bool):
+        """Redraw preview when subplot filters change."""
+        self._update_subplot_button_text()
+        self._update_preview_plot()
+
+    def _autoscale_preview(self):
+        """Autoscale all preview axes."""
+        for ax in self.figure.axes:
+            ax.relim()
+            ax.autoscale_view()
+        self.canvas.draw_idle()
+
+    def _on_canvas_click(self, event):
+        """Toggle focused panel on double-click."""
+        if not getattr(event, "dblclick", False) or event.inaxes is None:
+            return
+        key = self._axis_to_panel_key.get(id(event.inaxes))
+        if key is None:
+            return
+        if self._focused_panel_key == key:
+            self._focused_panel_key = None
+        else:
+            self._focused_panel_key = key
+        self._update_preview_plot()
+
+    def _populate_plot_presets(self):
+        """Populate the plot preset dropdown from project-defined plots."""
+        self.plot_preset_combo.blockSignals(True)
+        self.plot_preset_combo.clear()
+        self.plot_preset_combo.addItem("Manual selection", None)
+        for idx, plot in enumerate(self.project_state.plots):
+            title = str(plot.get("title", f"Plot {idx + 1}"))
+            self.plot_preset_combo.addItem(title, idx)
+        self.plot_preset_combo.setCurrentIndex(0)
+        self.plot_preset_combo.blockSignals(False)
+        self.subplot_menu_btn.setEnabled(False)
+
+    def _selected_preset_index(self) -> int | None:
+        """Return selected plot preset index or None for manual mode."""
+        data = self.plot_preset_combo.currentData()
+        if isinstance(data, int):
+            return data
+        return None
+
+    def _component_labels_for_signal(self, sig: str) -> list[str]:
+        """Return component labels for one signal."""
+        data = self._stack_logged_signal_2d(sig)
+        m, n = data.shape[1], data.shape[2]
+        if (m, n) == (1, 1):
+            return [sig]
+        if n == 1:
+            return [f"{sig}[{i}]" for i in range(m)]
+        return [f"{sig}[{r},{c}]" for r in range(m) for c in range(n)]
+
+    def _manual_component_filter(self) -> dict[str, set[str]]:
+        """Return selected component labels per checked signal."""
+        selected: dict[str, set[str]] = {}
+        for i in range(self.signal_tree.topLevelItemCount()):
+            parent = self.signal_tree.topLevelItem(i)
+            parent_data = parent.data(0, Qt.UserRole)
+            if not isinstance(parent_data, tuple) or len(parent_data) < 2:
+                continue
+            sig = str(parent_data[1])
+            labels: set[str] = set()
+            for c in range(parent.childCount()):
+                child = parent.child(c)
+                if child.checkState(0) != Qt.Checked:
+                    continue
+                child_data = child.data(0, Qt.UserRole)
+                if isinstance(child_data, tuple) and len(child_data) == 3:
+                    labels.add(str(child_data[2]))
+            if labels:
+                selected[sig] = labels
+        return selected
 
 
     def _stack_logged_signal_2d(self, sig: str) -> np.ndarray:
@@ -173,9 +343,21 @@ class PlotDialog(QDialog):
     def _update_preview_plot(self):
         """Redraw the embedded preview plot from the selected signals."""
         self.figure.clear()
-        ax = self.figure.add_subplot(111)
+        if self.multi_preset_cb.isChecked():
+            self._render_manual_multi_preview()
+            self.canvas.draw()
+            return
 
-        if not self.selected_signals:
+        preset_index = self._selected_preset_index()
+        if preset_index is None:
+            manual_filter = self._manual_component_filter()
+            active_signals = sorted(manual_filter.keys())
+        else:
+            preset_plot = self.project_state.plots[preset_index]
+            active_signals = sorted(str(sig) for sig in preset_plot.get("signals", []))
+
+        if not active_signals:
+            self._refresh_subplot_filter([], keep_current=False)
             self.canvas.draw()
             return
 
@@ -183,7 +365,8 @@ class PlotDialog(QDialog):
         T = len(time)
 
         try:
-            for sig in sorted(self.selected_signals):
+            series_by_signal: list[tuple[str, list[tuple[str, np.ndarray]]]] = []
+            for sig in active_signals:
                 data = self._stack_logged_signal_2d(sig)  # (T, m, n)
 
                 if data.shape[0] != T:
@@ -195,25 +378,82 @@ class PlotDialog(QDialog):
 
                 # scalar
                 if (m, n) == (1, 1):
-                    ax.step(time, data[:, 0, 0], where="post", label=sig)
+                    series_by_signal.append((sig, [(sig, data[:, 0, 0])]))
                     continue
 
                 # vector column (m,1)
                 if n == 1:
+                    sig_series = []
                     for i in range(m):
-                        ax.step(time, data[:, i, 0], where="post", label=f"{sig}[{i}]")
+                        sig_series.append((f"{sig}[{i}]", data[:, i, 0]))
+                    series_by_signal.append((sig, sig_series))
                     continue
 
                 # matrix (m,n)
+                sig_series = []
                 for r in range(m):
                     for c in range(n):
-                        ax.step(time, data[:, r, c], where="post", label=f"{sig}[{r},{c}]")
+                        sig_series.append((f"{sig}[{r},{c}]", data[:, r, c]))
+                series_by_signal.append((sig, sig_series))
 
-            ax.set_xlabel("Time [s]")
-            ax.grid(True)
-            ax.legend()
+            flat_series = [
+                (sig, label, values)
+                for sig, sig_series in series_by_signal
+                for label, values in sig_series
+            ]
+            if preset_index is None:
+                # Only keep user-checked components in manual mode.
+                filtered_series_by_signal = []
+                for sig, sig_series in series_by_signal:
+                    selected_labels = manual_filter.get(sig, set())
+                    keep = [(label, values) for label, values in sig_series if label in selected_labels]
+                    if keep:
+                        filtered_series_by_signal.append((sig, keep))
+                series_by_signal = filtered_series_by_signal
+                flat_series = [
+                    (sig, label, values)
+                    for sig, sig_series in series_by_signal
+                    for label, values in sig_series
+                ]
+                self._refresh_subplot_filter([], keep_current=False)
+                # Keep original manual behavior: one overlay plot.
+                mode = "__all__"
+            else:
+                plot = self.project_state.plots[preset_index]
+                mode = self._resolve_defined_mode(plot, flat_series, series_by_signal)
+                panels = self._build_panels_for_mode(mode, series_by_signal, flat_series)
+                self._refresh_subplot_filter(panels, keep_current=True)
+                enabled_panel_keys = self._selected_subplot_keys()
+                panels = [panel for panel in panels if panel[1] in enabled_panel_keys]
+                self._render_panels(time, panels)
+                self._finalize_layout()
+                self.canvas.draw()
+                return
+
+            if mode == "__all__":
+                ax = self.figure.add_subplot(111)
+                for _, label, values in flat_series:
+                    ax.step(time, values, where="post", label=label)
+                self._style_axis(ax)
+            elif mode == "__split_signals__":
+                axes = self.figure.subplots(len(series_by_signal), 1, sharex=True, squeeze=False).flatten()
+                for i, (sig, sig_series) in enumerate(series_by_signal):
+                    ax = axes[i]
+                    for label, values in sig_series:
+                        ax.step(time, values, where="post", label=label)
+                    ax.set_title(sig)
+                    self._style_axis(ax)
+            elif mode == "__split_components__":
+                axes = self.figure.subplots(len(flat_series), 1, sharex=True, squeeze=False).flatten()
+                for i, (_, label, values) in enumerate(flat_series):
+                    ax = axes[i]
+                    ax.step(time, values, where="post", label=label)
+                    ax.set_title(label)
+                    self._style_axis(ax)
+            self._finalize_layout()
 
         except Exception as e:
+            ax = self.figure.add_subplot(111)
             # Keep the UI responsive; show the error inside the plot area.
             ax.text(
                 0.01, 0.99,
@@ -226,6 +466,206 @@ class PlotDialog(QDialog):
             ax.set_axis_off()
 
         self.canvas.draw()
+
+    def _render_manual_multi_preview(self) -> None:
+        """Render checked manual signals as multiple panels."""
+        manual_filter = self._manual_component_filter()
+        active_signals = sorted(manual_filter.keys())
+        if not active_signals:
+            ax = self.figure.add_subplot(111)
+            ax.text(
+                0.01, 0.99,
+                "No signals selected.\nUse 'Signals (logged)'.",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+            )
+            ax.set_axis_off()
+            return
+
+        time = np.asarray(self.project_state.logs["time"]).flatten()
+        T = len(time)
+        panels: list[tuple[str, str, list[tuple[str, np.ndarray]]]] = []
+        for sig in active_signals:
+            data = self._stack_logged_signal_2d(sig)
+            if data.shape[0] != T:
+                raise ValueError(
+                    f"Time length mismatch for '{sig}': time has {T} samples but signal has {data.shape[0]}."
+                )
+            m, n = data.shape[1], data.shape[2]
+            if (m, n) == (1, 1):
+                sig_series = [(sig, data[:, 0, 0])]
+            elif n == 1:
+                sig_series = [(f"{sig}[{i}]", data[:, i, 0]) for i in range(m)]
+            else:
+                sig_series = [(f"{sig}[{r},{c}]", data[:, r, c]) for r in range(m) for c in range(n)]
+
+            selected_labels = manual_filter.get(sig, set())
+            sig_series = [(label, values) for label, values in sig_series if label in selected_labels]
+            if not sig_series:
+                continue
+            panels.append((sig, f"sig::{sig}", sig_series))
+
+        self._refresh_subplot_filter([], keep_current=False)
+        self._render_panels(time, panels)
+        self._finalize_layout()
+
+    def _refresh_subplot_filter(self, panels: list[tuple[str, str, list[tuple[str, np.ndarray]]]], keep_current: bool):
+        """Rebuild subplot check-list from panel descriptors."""
+        current_enabled = self._selected_subplot_keys() if keep_current else set()
+        new_items = [(title, key) for title, key, _ in panels]
+        if new_items == self._subplot_items and keep_current:
+            return
+
+        self._subplot_items = new_items
+        self._subplot_actions.clear()
+        self.subplot_menu.clear()
+        for title, key in new_items:
+            checked = (key in current_enabled) if keep_current else True
+            action = self.subplot_menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(checked)
+            action.toggled.connect(self._on_subplot_toggled)
+            self._subplot_actions[key] = action
+        self._update_subplot_button_text()
+
+    def _selected_subplot_keys(self) -> set[str]:
+        """Return selected subplot panel keys."""
+        if not self._subplot_actions:
+            return set()
+        keys: set[str] = set()
+        for key, action in self._subplot_actions.items():
+            if action.isChecked():
+                if isinstance(key, str):
+                    keys.add(key)
+        return keys
+
+    def _update_subplot_button_text(self) -> None:
+        """Update dropdown button label with current selection count."""
+        total = len(self._subplot_actions)
+        if total == 0:
+            self.subplot_menu_btn.setText("Select subplots")
+            return
+        selected = len(self._selected_subplot_keys())
+        self.subplot_menu_btn.setText(f"Subplots: {selected}/{total}")
+
+    def _resolve_defined_mode(
+        self,
+        plot: dict,
+        flat_series: list[tuple[str, str, np.ndarray]],
+        series_by_signal: list[tuple[str, list[tuple[str, np.ndarray]]]],
+    ) -> str:
+        """Resolve mode for a predefined plot using same defaults as project plots."""
+        mode = str(plot.get("mode", "auto")).strip().lower()
+        if mode in {"overlay", "split_signals", "split_components"}:
+            return mode
+        if mode != "auto":
+            return "overlay"
+        if len(flat_series) > 6:
+            return "split_components"
+        if len(series_by_signal) > 2:
+            return "split_signals"
+        return "overlay"
+
+    def _build_panels_for_mode(
+        self,
+        mode: str,
+        series_by_signal: list[tuple[str, list[tuple[str, np.ndarray]]]],
+        flat_series: list[tuple[str, str, np.ndarray]],
+    ) -> list[tuple[str, str, list[tuple[str, np.ndarray]]]]:
+        """Build panel descriptors: (title, key, series list)."""
+        if mode == "overlay":
+            panel_series = [(label, values) for _, label, values in flat_series]
+            return [("Overlay", "overlay::all", panel_series)]
+
+        if mode == "split_signals":
+            panels = []
+            for sig, sig_series in series_by_signal:
+                panels.append((sig, f"sig::{sig}", sig_series))
+            return panels
+
+        panels = []
+        for _, label, values in flat_series:
+            panels.append((label, f"cmp::{label}", [(label, values)]))
+        return panels
+
+    def _render_panels(self, time: np.ndarray, panels: list[tuple[str, str, list[tuple[str, np.ndarray]]]]) -> None:
+        """Render selected panels on one or multiple subplots."""
+        self._axis_to_panel_key.clear()
+        if self._focused_panel_key is not None:
+            existing_keys = {key for _, key, _ in panels}
+            if self._focused_panel_key in existing_keys:
+                panels = [p for p in panels if p[1] == self._focused_panel_key]
+            else:
+                self._focused_panel_key = None
+
+        if not panels:
+            ax = self.figure.add_subplot(111)
+            ax.text(
+                0.01,
+                0.99,
+                "No subplot selected.",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+            )
+            ax.set_axis_off()
+            return
+
+        if len(panels) == 1:
+            ax = self.figure.add_subplot(111)
+            title, key, series = panels[0]
+            for label, values in series:
+                ax.step(time, values, where="post", label=label)
+            ax.set_title(title)
+            self._style_axis(ax)
+            self._axis_to_panel_key[id(ax)] = key
+            return
+
+        rows, cols = self._panel_grid_shape(len(panels))
+        share_x = cols == 1
+        axes_grid = self.figure.subplots(rows, cols, sharex=share_x, squeeze=False)
+        axes = axes_grid.flatten()
+        for i, (title, key, series) in enumerate(panels):
+            ax = axes[i]
+            for label, values in series:
+                ax.step(time, values, where="post", label=label)
+            ax.set_title(title)
+            self._style_axis(ax)
+            self._axis_to_panel_key[id(ax)] = key
+
+        # Hide unused cells when panel count does not fill the grid.
+        for j in range(len(panels), len(axes)):
+            axes[j].set_axis_off()
+
+    def _style_axis(self, ax) -> None:
+        """Apply user-selected axis style."""
+        ax.set_xlabel("Time [s]")
+        ax.grid(self.grid_cb.isChecked())
+        if self.legend_cb.isChecked() and ax.lines:
+            ax.legend()
+
+
+    def _finalize_layout(self) -> None:
+        """Apply a robust layout for many stacked axes."""
+        n_axes = len(self.figure.axes)
+        if n_axes >= 8:
+            self.figure.subplots_adjust(hspace=0.75)
+            return
+        self.figure.tight_layout()
+
+    def _panel_grid_shape(self, n_panels: int) -> tuple[int, int]:
+        """Return (rows, cols) layout for panel rendering."""
+        if n_panels <= 1:
+            return 1, 1
+        if n_panels == 2:
+            return 2, 1
+        if n_panels == 3:
+            return 3, 1
+        if n_panels == 4:
+            return 2, 2
+        rows = int(np.ceil(n_panels / 2))
+        return rows, 2
 
     def _plot_defined_plots(self):
         """Open standalone matplotlib windows for the configured plots."""
