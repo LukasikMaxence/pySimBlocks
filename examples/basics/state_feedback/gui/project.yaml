@@ -16,9 +16,20 @@ simulation:
     - system.outputs.y
   plots:
     - title: Ref vs Output
+      mode: overlay
       signals: [step.outputs.out, system.outputs.y]
     - title: Command
+      mode: overlay
       signals: [controller.outputs.u]
+    - title: Full closed-loop (components)
+      mode: split_components
+      signals: [step.outputs.out, system.outputs.y, controller.outputs.u, system.outputs.x]
+    - title: Tracking and states
+      mode: split_signals
+      signals: [step.outputs.out, system.outputs.y, system.outputs.x]
+    - title: States only
+      mode: split_components
+      signals: [system.outputs.x]
 
 diagram:
   blocks:
