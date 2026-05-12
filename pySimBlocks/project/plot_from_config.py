@@ -87,7 +87,7 @@ def _resolve_plot_mode(plot: dict, total_series: int, signal_count: int) -> str:
     if mode != "auto":
         return "overlay"
 
-    # Simulink-like readability: split automatically when too many curves.
+    # split automatically when too many curves.
     if total_series > 6:
         return "split_components"
     if signal_count > 2:

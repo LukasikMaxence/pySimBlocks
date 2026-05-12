@@ -102,12 +102,21 @@ class PlotDialog(QDialog):
         left_layout.addWidget(self.plot_preset_combo)
 
         left_layout.addWidget(QLabel("<b>Subplots filter</b>"))
+        subplot_row = QHBoxLayout()
         self.subplot_menu_btn = QToolButton()
         self.subplot_menu_btn.setText("Select subplots")
         self.subplot_menu_btn.setPopupMode(QToolButton.InstantPopup)
         self.subplot_menu = QMenu(self.subplot_menu_btn)
         self.subplot_menu_btn.setMenu(self.subplot_menu)
-        left_layout.addWidget(self.subplot_menu_btn)
+        subplot_row.addWidget(self.subplot_menu_btn, 1)
+        self.subplot_all_cb = QCheckBox("All")
+        self.subplot_all_cb.setToolTip(
+            "Checked: every subplot in the filter is shown. Uncheck to hide all, or use the menu for a partial selection."
+        )
+        self.subplot_all_cb.stateChanged.connect(self._on_subplot_all_cb_changed)
+        self.subplot_all_cb.setEnabled(False)
+        subplot_row.addWidget(self.subplot_all_cb)
+        left_layout.addLayout(subplot_row)
 
         self.plot_defined_btn = QPushButton("Plot defined plots")
         self.plot_defined_btn.clicked.connect(self._plot_defined_plots)
@@ -201,6 +210,7 @@ class PlotDialog(QDialog):
         is_manual = self._selected_preset_index() is None
         self.signal_tree.setEnabled(is_manual)
         self.subplot_menu_btn.setEnabled(not is_manual)
+        self._sync_subplot_all_checkbox()
         self._update_preview_plot()
 
     def _on_multi_mode_changed(self, _state: int):
@@ -212,11 +222,13 @@ class PlotDialog(QDialog):
         else:
             self.signal_tree.setEnabled(self._selected_preset_index() is None)
         self.subplot_menu_btn.setEnabled(not is_multi and self._selected_preset_index() is not None)
+        self._sync_subplot_all_checkbox()
         self._update_preview_plot()
 
     def _on_subplot_toggled(self, _checked: bool):
         """Redraw preview when subplot filters change."""
         self._update_subplot_button_text()
+        self._sync_subplot_all_checkbox()
         self._update_preview_plot()
 
     def _autoscale_preview(self):
@@ -250,6 +262,7 @@ class PlotDialog(QDialog):
         self.plot_preset_combo.setCurrentIndex(0)
         self.plot_preset_combo.blockSignals(False)
         self.subplot_menu_btn.setEnabled(False)
+        self._sync_subplot_all_checkbox()
 
     def _selected_preset_index(self) -> int | None:
         """Return selected plot preset index or None for manual mode."""
@@ -528,6 +541,33 @@ class PlotDialog(QDialog):
             action.toggled.connect(self._on_subplot_toggled)
             self._subplot_actions[key] = action
         self._update_subplot_button_text()
+        self._sync_subplot_all_checkbox()
+
+    def _on_subplot_all_cb_changed(self, *_args: object) -> None:
+        """Apply or clear all subplot menu checks from the All checkbox."""
+        if not self._subplot_actions:
+            return
+        check_all = self.subplot_all_cb.isChecked()
+        for action in self._subplot_actions.values():
+            action.blockSignals(True)
+            action.setChecked(check_all)
+            action.blockSignals(False)
+        self._update_subplot_button_text()
+        self._update_preview_plot()
+
+    def _sync_subplot_all_checkbox(self) -> None:
+        """Enable the All checkbox and mirror whether every subplot action is checked."""
+        self.subplot_all_cb.blockSignals(True)
+        try:
+            enabled = self.subplot_menu_btn.isEnabled() and len(self._subplot_actions) > 0
+            self.subplot_all_cb.setEnabled(enabled)
+            if not enabled or not self._subplot_actions:
+                self.subplot_all_cb.setChecked(False)
+            else:
+                all_on = all(action.isChecked() for action in self._subplot_actions.values())
+                self.subplot_all_cb.setChecked(all_on)
+        finally:
+            self.subplot_all_cb.blockSignals(False)
 
     def _selected_subplot_keys(self) -> set[str]:
         """Return selected subplot panel keys."""
