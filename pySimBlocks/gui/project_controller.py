@@ -395,6 +395,25 @@ class ProjectController(QObject):
         del self.project_state.plots[index]
         self.make_dirty()
 
+    def add_manual_layout_preset(self, plot: dict) -> int:
+        """Append a manual multi-panel layout preset to the project.
+
+        Args:
+            plot: Plot descriptor with ``layout: manual`` and ``panels``.
+
+        Returns:
+            Index of the new preset in :attr:`ProjectState.plots`.
+        """
+        for panel in plot.get("panels", []):
+            if not isinstance(panel, dict):
+                continue
+            selection = panel.get("selection", {})
+            if isinstance(selection, dict):
+                self._ensure_logged(list(selection.keys()))
+        self.project_state.plots.append(plot)
+        self.make_dirty()
+        return len(self.project_state.plots) - 1
+
     def update_simulation_params(self, params: dict[str, float | str]) -> None:
         """Apply new simulation parameters to the project state.
 
@@ -467,6 +486,41 @@ class ProjectController(QObject):
 
         for i in reversed(range(len(self.project_state.plots))):
             plot = self.project_state.plots[i]
+            if str(plot.get("layout", "")).strip().lower() == "manual":
+                panels = plot.get("panels", [])
+                if not isinstance(panels, list):
+                    continue
+                kept_panels = []
+                for panel in panels:
+                    if not isinstance(panel, dict):
+                        continue
+                    selection = panel.get("selection")
+                    if isinstance(selection, dict):
+                        new_sel = {
+                            sig: [lbl for lbl in labels if lbl not in removed_signals]
+                            for sig, labels in selection.items()
+                            if sig not in removed_signals
+                        }
+                        new_sel = {sig: labels for sig, labels in new_sel.items() if labels}
+                        if new_sel:
+                            panel = dict(panel)
+                            panel["selection"] = new_sel
+                            kept_panels.append(panel)
+                        continue
+                    signals = panel.get("signals", [])
+                    if isinstance(signals, list):
+                        signals = [s for s in signals if s not in removed_signals]
+                        if signals:
+                            panel = dict(panel)
+                            panel["signals"] = signals
+                            kept_panels.append(panel)
+                if kept_panels:
+                    plot["panels"] = kept_panels
+                else:
+                    del self.project_state.plots[i]
+                continue
+            if "signals" not in plot:
+                continue
             plot["signals"] = [s for s in plot["signals"] if s not in removed_signals]
             if not plot["signals"]:
                 del self.project_state.plots[i]

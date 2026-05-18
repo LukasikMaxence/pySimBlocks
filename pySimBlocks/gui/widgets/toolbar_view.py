@@ -25,7 +25,6 @@ from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt
 
 from pySimBlocks.gui.dialogs.display_yaml_dialog import DisplayYamlDialog
-from pySimBlocks.gui.dialogs.plot_dialog import PlotDialog
 from pySimBlocks.gui.dialogs.settings_dialog import SettingsDialog
 from pySimBlocks.gui.project_controller import ProjectController
 from pySimBlocks.gui.services.project_saver import ProjectSaver
@@ -133,6 +132,10 @@ class ToolBarView(QToolBar):
 
     def on_save(self) -> None:
         """Save the project and clear the dirty flag."""
+        window = self.window()
+        if hasattr(window, "save_project"):
+            window.save_project()
+            return
         self.saver.save(self.project_controller.project_state, self.project_controller.view.block_items)
         self.project_controller.clear_dirty()
 
@@ -191,7 +194,13 @@ class ToolBarView(QToolBar):
             )
             return
         # Open as an independent top-level window so fullscreen works reliably.
-        self._plot_dialog = PlotDialog(self.project_controller.project_state, None)  # keep ref because of python garbage collector
+        from pySimBlocks.gui.dialogs.plot_dialog import PlotDialog
+
+        self._plot_dialog = PlotDialog(
+            self.project_controller.project_state,
+            self.project_controller,
+            None,
+        )  # keep ref because of python garbage collector
         self._plot_dialog.show()
 
     def set_running(self, running: bool) -> None:

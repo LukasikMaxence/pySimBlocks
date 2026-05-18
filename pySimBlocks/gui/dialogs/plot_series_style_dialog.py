@@ -20,11 +20,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from copy import copy
 from functools import lru_cache
 
-from matplotlib.lines import Line2D
 from matplotlib.markers import MarkerStyle
 
 from PySide6.QtWidgets import (
@@ -42,50 +40,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
-
-@dataclass
-class SeriesStyle:
-    """Matplotlib draw style for one logged series component."""
-
-    color: str = ""
-    linestyle: str = "-"
-    marker: str = ""
-    display_name: str = ""
-
-
-DEFAULT_SERIES_STYLE = SeriesStyle()
+from pySimBlocks.project.plot_series_helpers import (
+    DEFAULT_SERIES_STYLE,
+    SeriesStyle,
+    is_usable_line_marker,
+    normalize_marker_code,
+    normalize_plot_marker,
+)
 
 _SKIP_MARKERS = frozenset({"", " ", "None", "none"})
-
-
-def normalize_marker_code(marker: object) -> str:
-    """Return a stripped marker code string, or empty for no marker."""
-    if marker is None:
-        return ""
-    text = str(marker).strip()
-    if not text or text.lower() in _SKIP_MARKERS:
-        return ""
-    return text
-
-
-def is_usable_line_marker(marker: object) -> bool:
-    """True if matplotlib can draw this marker on a Line2D (step/plot)."""
-    code = normalize_marker_code(marker)
-    if not code:
-        return False
-    try:
-        Line2D([0], [0], marker=code)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def normalize_plot_marker(marker: object) -> str:
-    """Return marker code for plotting, or '' if missing or not supported on lines."""
-    code = normalize_marker_code(marker)
-    if not code:
-        return ""
-    return code if is_usable_line_marker(code) else ""
 
 
 def marker_display_label(marker: str) -> str:

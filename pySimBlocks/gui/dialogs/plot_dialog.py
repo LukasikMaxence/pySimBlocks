@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout,
     QLabel, QTreeWidget, QTreeWidgetItem,
     QPushButton, QSizePolicy, QMessageBox, QComboBox, QToolButton, QMenu, QCheckBox,
-    QSpinBox, QHeaderView, QLineEdit,
+    QSpinBox, QHeaderView, QLineEdit, QInputDialog,
 )
 from PySide6.QtCore import Qt
 
@@ -37,12 +37,18 @@ from matplotlib.figure import Figure
 from pySimBlocks.gui.models.project_state import ProjectState
 from pySimBlocks.core.config import PlotConfig
 from pySimBlocks.project.plot_from_config import plot_from_config
-from pySimBlocks.gui.dialogs.plot_series_style_dialog import (
-    SeriesStyle,
-    SeriesStyleDialog,
-    DEFAULT_SERIES_STYLE,
-)
+from pySimBlocks.gui.dialogs.plot_series_style_dialog import SeriesStyleDialog
 from pySimBlocks.gui.plot_series_draw import plot_step_series
+from pySimBlocks.gui.project_controller import ProjectController
+from pySimBlocks.project.plot_series_helpers import (
+    DEFAULT_SERIES_STYLE,
+    SeriesStyle,
+    flatten_series,
+    is_manual_layout_plot,
+    manual_layout_to_plot_dict,
+    manual_state_from_layout_plot,
+    resolve_series_style,
+)
 
 
 class PlotDialog(QDialog):
@@ -53,17 +59,24 @@ class PlotDialog(QDialog):
         signal tree selection: Checked signals/components for manual preview.
     """
 
-    def __init__(self, project_state: ProjectState, parent=None):
+    def __init__(
+        self,
+        project_state: ProjectState,
+        project_controller: ProjectController | None = None,
+        parent=None,
+    ):
         """Initialize the plot dialog.
 
         Args:
             project_state: Project state providing logs and plot definitions.
+            project_controller: Controller used to persist predefined plots.
             parent: Optional parent widget.
 
         Raises:
             None.
         """
         super().__init__(parent)
+        self.project_controller = project_controller
         self.setWindowTitle("Plot signals")
         self.resize(900, 500)
         self.setWindowFlag(Qt.Window, True)
@@ -143,6 +156,15 @@ class PlotDialog(QDialog):
         self._disable_enter_key_activation(self.manual_remove_plot_btn)
         self.manual_remove_plot_btn.clicked.connect(self._on_manual_remove_selected_plot)
         left_layout.addWidget(self.manual_remove_plot_btn)
+
+        self.save_preset_btn = QPushButton("Save as plot preset")
+        self.save_preset_btn.setToolTip(
+            "Save the current manual layout as one plot preset "
+            "(reload it later from Plot preset; persist with Ctrl+S)."
+        )
+        self._disable_enter_key_activation(self.save_preset_btn)
+        self.save_preset_btn.clicked.connect(self._save_manual_as_plot_preset)
+        left_layout.addWidget(self.save_preset_btn)
 
         title = QLabel("<b>Signals (logged)</b>")
         left_layout.addWidget(title)
@@ -238,9 +260,9 @@ class PlotDialog(QDialog):
         finally:
             self._updating_signal_tree = False
 
-    def _get_series_style(self, label: str) -> SeriesStyle:
-        """Return stored style for a series label, or the default."""
-        return self._series_styles.get(label, DEFAULT_SERIES_STYLE)
+    def _get_series_style(self, label: str, plot: dict | None = None) -> SeriesStyle:
+        """Return merged style for a series (session overrides, then plot config)."""
+        return resolve_series_style(label, self._series_styles, plot)
 
     def _tree_label_for_component(self, internal_label: str) -> str:
         """Text shown in the signal tree for one component."""
@@ -302,33 +324,52 @@ class PlotDialog(QDialog):
                         parent.setCheckState(0, Qt.Checked)
         finally:
             self._updating_signal_tree = False
-        if self._is_manual_mode():
+        if self._uses_manual_layout():
             self._save_active_manual_selection()
         self._update_preview_plot()
 
     def _on_plot_preset_changed(self, _index: int):
         """Handle plot preset selection changes."""
-        is_manual = self._is_manual_mode()
-        self.signal_tree.setEnabled(is_manual)
-        self.subplot_menu_btn.setEnabled(not is_manual)
+        layout_preset = self._is_manual_layout_preset()
+        free_manual = self._is_manual_mode()
+        self.signal_tree.setEnabled(free_manual or layout_preset)
+        self.subplot_menu_btn.setEnabled(not free_manual and not layout_preset)
         self._sync_manual_controls_enabled()
         self._sync_subplot_all_checkbox()
-        if is_manual:
+        if layout_preset:
+            idx = self._selected_preset_index()
+            if idx is not None:
+                self._load_manual_state_from_layout_plot(self.project_state.plots[idx])
+        elif free_manual:
             self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
         self._update_preview_plot()
 
     def _is_manual_mode(self) -> bool:
-        """Return True when manual plot editing is active."""
+        """Return True when editing a free manual layout (not a saved preset)."""
         return self._selected_preset_index() is None
 
+    def _is_manual_layout_preset(self) -> bool:
+        """Return True when the selected preset is a saved manual layout."""
+        idx = self._selected_preset_index()
+        if idx is None:
+            return False
+        return is_manual_layout_plot(self.project_state.plots[idx])
+
+    def _uses_manual_layout(self) -> bool:
+        """Return True when the preview uses the multi-panel manual layout."""
+        return self._is_manual_mode() or self._is_manual_layout_preset()
+
     def _sync_manual_controls_enabled(self) -> None:
-        """Enable manual plot controls only in manual selection mode."""
-        enabled = self._is_manual_mode()
+        """Enable manual plot controls for free manual and layout presets."""
+        enabled = self._uses_manual_layout()
         self.manual_plot_count_spin.setEnabled(enabled)
         self.manual_plot_combo.setEnabled(enabled)
         self.manual_plot_title_edit.setEnabled(enabled)
         can_remove = enabled and self.manual_plot_count_spin.value() > 1
         self.manual_remove_plot_btn.setEnabled(can_remove)
+        self.save_preset_btn.setEnabled(
+            self._is_manual_mode() and self.project_controller is not None
+        )
 
     @staticmethod
     def _default_manual_plot_title(index: int) -> str:
@@ -573,6 +614,8 @@ class PlotDialog(QDialog):
         self.plot_preset_combo.addItem("Manual selection", None)
         for idx, plot in enumerate(self.project_state.plots):
             title = str(plot.get("title", f"Plot {idx + 1}"))
+            if is_manual_layout_plot(plot):
+                title = f"{title} (layout)"
             self.plot_preset_combo.addItem(title, idx)
         self.plot_preset_combo.setCurrentIndex(0)
         self.plot_preset_combo.blockSignals(False)
@@ -651,8 +694,9 @@ class PlotDialog(QDialog):
         """Redraw the embedded preview plot from the selected signals."""
         self.figure.clear()
         preset_index = self._selected_preset_index()
-        if preset_index is None:
-            self._save_active_manual_selection()
+        if self._uses_manual_layout():
+            if self._is_manual_mode():
+                self._save_active_manual_selection()
             self._render_manual_plots_preview()
             self.canvas.draw()
             return
@@ -700,18 +744,13 @@ class PlotDialog(QDialog):
                         sig_series.append((f"{sig}[{r},{c}]", data[:, r, c]))
                 series_by_signal.append((sig, sig_series))
 
-            flat_series = [
-                (sig, label, values)
-                for sig, sig_series in series_by_signal
-                for label, values in sig_series
-            ]
-            plot = self.project_state.plots[preset_index]
-            mode = self._resolve_defined_mode(plot, flat_series, series_by_signal)
+            flat_series = flatten_series(series_by_signal)
+            mode = self._resolve_defined_mode(preset_plot, flat_series, series_by_signal)
             panels = self._build_panels_for_mode(mode, series_by_signal, flat_series)
             self._refresh_subplot_filter(panels, keep_current=True)
             enabled_panel_keys = self._selected_subplot_keys()
             panels = [panel for panel in panels if panel[1] in enabled_panel_keys]
-            self._render_panels(time, panels)
+            self._render_panels(time, panels, plot=preset_plot)
             self._finalize_layout()
 
         except Exception as e:
@@ -950,7 +989,79 @@ class PlotDialog(QDialog):
             panels.append((label, f"cmp::{label}", [(label, values)]))
         return panels
 
-    def _render_panels(self, time: np.ndarray, panels: list[tuple[str, str, list[tuple[str, np.ndarray]]]]) -> None:
+    def _load_manual_state_from_layout_plot(self, plot: dict) -> None:
+        """Restore manual panels, titles, and styles from a layout preset."""
+        selections, titles, styles = manual_state_from_layout_plot(plot)
+        if not selections:
+            self._manual_plot_selections = [{}]
+            self._manual_plot_titles = [self._default_manual_plot_title(0)]
+        else:
+            self._manual_plot_selections = selections
+            self._manual_plot_titles = titles
+        self._series_styles = styles
+        self._manual_active_plot = 0
+        self.manual_plot_count_spin.blockSignals(True)
+        self.manual_plot_count_spin.setValue(len(self._manual_plot_selections))
+        self.manual_plot_count_spin.blockSignals(False)
+        self._rebuild_manual_plot_combo()
+        self._load_active_manual_title()
+        self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
+
+    def _save_manual_as_plot_preset(self) -> None:
+        """Save the current manual layout as a single reloadable plot preset."""
+        if self.project_controller is None or not self._is_manual_mode():
+            return
+
+        self._save_active_manual_selection()
+        self._save_active_manual_title()
+        self._ensure_manual_titles()
+
+        default_name = self._manual_plot_title(0) if self._manual_plot_titles else "Manual layout"
+        name, ok = QInputDialog.getText(
+            self,
+            "Save as plot preset",
+            "Preset name:",
+            text=default_name,
+        )
+        if not ok or not name.strip():
+            return
+
+        plot_dict = manual_layout_to_plot_dict(
+            name.strip(),
+            self._manual_plot_titles,
+            self._manual_plot_selections,
+            self._series_styles,
+        )
+        if plot_dict is None:
+            QMessageBox.warning(
+                self,
+                "Nothing to save",
+                "No plot panel has any signal selected.\n"
+                "Check signals for at least one panel.",
+            )
+            return
+
+        new_index = self.project_controller.add_manual_layout_preset(plot_dict)
+        self._populate_plot_presets()
+        self.plot_preset_combo.blockSignals(True)
+        self.plot_preset_combo.setCurrentIndex(
+            self.plot_preset_combo.findData(new_index)
+        )
+        self.plot_preset_combo.blockSignals(False)
+        self._on_plot_preset_changed(self.plot_preset_combo.currentIndex())
+        QMessageBox.information(
+            self,
+            "Plot preset saved",
+            f"Preset « {name.strip()} » added ({len(plot_dict.get('panels', []))} panels).\n"
+            "Save the project (Ctrl+S) to write it to project.yaml.",
+        )
+
+    def _render_panels(
+        self,
+        time: np.ndarray,
+        panels: list[tuple[str, str, list[tuple[str, np.ndarray]]]],
+        plot: dict | None = None,
+    ) -> None:
         """Render selected panels on one or multiple subplots."""
         self._axis_to_panel_key.clear()
         if self._focused_panel_key is not None:
@@ -977,7 +1088,7 @@ class PlotDialog(QDialog):
             ax = self.figure.add_subplot(111)
             title, key, series = panels[0]
             for label, values in series:
-                plot_step_series(ax, time, values, label, self._get_series_style(label))
+                plot_step_series(ax, time, values, label, self._get_series_style(label, plot))
             ax.set_title(title)
             self._style_axis(ax)
             self._axis_to_panel_key[id(ax)] = key
@@ -990,7 +1101,7 @@ class PlotDialog(QDialog):
         for i, (title, key, series) in enumerate(panels):
             ax = axes[i]
             for label, values in series:
-                plot_step_series(ax, time, values, label, self._get_series_style(label))
+                plot_step_series(ax, time, values, label, self._get_series_style(label, plot))
             ax.set_title(title)
             self._style_axis(ax)
             self._axis_to_panel_key[id(ax)] = key

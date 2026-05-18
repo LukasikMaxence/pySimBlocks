@@ -24,6 +24,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from pySimBlocks.core.config import PlotConfig
+from pySimBlocks.project.plot_series_helpers import (
+    flatten_series,
+    is_manual_layout_plot,
+    plot_step_series_styled,
+    resolve_series_style,
+)
 
 
 def _stack_logged_signal(logs: dict, sig: str) -> np.ndarray:
@@ -159,6 +165,8 @@ def plot_from_config(
         return
 
     for plot in plot_cfg.plots:
+        if is_manual_layout_plot(plot):
+            continue
         title = plot.get("title", "")
         signals = plot["signals"]
         series_by_signal: list[tuple[str, list[tuple[str, np.ndarray]]]] = []
@@ -171,17 +179,15 @@ def plot_from_config(
                 )
             series_by_signal.append((sig, _series_from_signal(logs, sig)))
 
-        flat_series = [
-            (sig, label, values)
-            for sig, sig_series in series_by_signal
-            for label, values in sig_series
-        ]
+        flat_series = flatten_series(series_by_signal)
         mode = _resolve_plot_mode(plot, total_series=len(flat_series), signal_count=len(signals))
+        session_styles: dict = {}
 
         if mode == "overlay":
             fig, ax = plt.subplots()
             for _, label, values in flat_series:
-                ax.step(time, values, where="post", label=label)
+                style = resolve_series_style(label, session_styles, plot)
+                plot_step_series_styled(ax, time, values, label, style)
             _style_axes(ax, title, show_legend=True)
             fig.tight_layout()
             continue
@@ -192,7 +198,8 @@ def plot_from_config(
             for i, (sig, sig_series) in enumerate(series_by_signal):
                 ax = axes_1d[i]
                 for label, values in sig_series:
-                    ax.step(time, values, where="post", label=label)
+                    style = resolve_series_style(label, session_styles, plot)
+                    plot_step_series_styled(ax, time, values, label, style)
                 panel_title = f"{title} - {sig}" if title else sig
                 _style_axes(ax, panel_title, show_legend=True)
             fig.tight_layout()
@@ -203,7 +210,8 @@ def plot_from_config(
         axes_1d = axes.flatten()
         for i, (_, label, values) in enumerate(flat_series):
             ax = axes_1d[i]
-            ax.step(time, values, where="post", label=label)
+            style = resolve_series_style(label, session_styles, plot)
+            plot_step_series_styled(ax, time, values, label, style)
             panel_title = f"{title} - {label}" if title else label
             _style_axes(ax, panel_title, show_legend=False)
         fig.tight_layout()

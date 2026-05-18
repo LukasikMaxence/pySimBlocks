@@ -26,6 +26,7 @@ from PySide6.QtCore import Qt
 
 from pySimBlocks.gui.models.project_state import ProjectState
 from pySimBlocks.gui.project_controller import ProjectController
+from pySimBlocks.project.plot_series_helpers import is_manual_layout_plot
 
 
 class PlotSettingsWidget(QWidget):
@@ -128,7 +129,10 @@ class PlotSettingsWidget(QWidget):
         """Refresh the plot titles shown in the list widget."""
         self.plot_list.clear()
         for plot in self.project_state.plots:
-            self.plot_list.addItem(plot["title"])
+            title = plot["title"]
+            if is_manual_layout_plot(plot):
+                title = f"{title} (layout)"
+            self.plot_list.addItem(title)
 
     def populate_signal_list(self, checked=None):
         """Populate the signal checklist.
@@ -183,6 +187,17 @@ class PlotSettingsWidget(QWidget):
         self.edit_index = index
         plot = self.project_state.plots[index]
         self.title_edit.setText(plot["title"])
+        if is_manual_layout_plot(plot):
+            self.mode_combo.setCurrentIndex(0)
+            self.signal_list.clear()
+            n_panels = len(plot.get("panels", []))
+            item = QListWidgetItem(
+                f"Manual layout ({n_panels} panels) — edit in the Plot dialog"
+            )
+            item.setFlags(Qt.NoItemFlags)
+            self.signal_list.addItem(item)
+            self.update_buttons_state()
+            return
         mode = str(plot.get("mode", "auto"))
         self._set_mode_combo(mode)
         self.populate_signal_list(plot["signals"])
@@ -201,6 +216,13 @@ class PlotSettingsWidget(QWidget):
         title = self.title_edit.text().strip()
         if not title:
             QMessageBox.warning(self, "Invalid plot", "Plot title cannot be empty.")
+            return
+
+        if self.edit_index is not None and is_manual_layout_plot(self.project_state.plots[self.edit_index]):
+            self.project_state.plots[self.edit_index]["title"] = title
+            self.project_controller.make_dirty()
+            self.plot_list.item(self.edit_index).setText(f"{title} (layout)")
+            self.update_buttons_state()
             return
 
         signals = self.collect_selected_signals()

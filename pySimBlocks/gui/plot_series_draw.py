@@ -22,11 +22,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from pySimBlocks.gui.dialogs.plot_series_style_dialog import (
-    DEFAULT_SERIES_STYLE,
-    SeriesStyle,
-    normalize_plot_marker,
-)
+from pySimBlocks.project.plot_series_helpers import SeriesStyle, plot_step_series_styled
 
 
 def plot_step_series(
@@ -37,14 +33,4 @@ def plot_step_series(
     style: SeriesStyle | None = None,
 ) -> None:
     """Draw one step series on ``ax`` using optional line/marker/color style."""
-    st = style or DEFAULT_SERIES_STYLE
-    legend = st.display_name.strip() if st.display_name.strip() else label
-    kwargs: dict = {"where": "post", "label": legend}
-    if st.color:
-        kwargs["color"] = st.color
-    if st.linestyle:
-        kwargs["linestyle"] = st.linestyle
-    marker = normalize_plot_marker(st.marker)
-    if marker:
-        kwargs["marker"] = marker
-    ax.step(time, values, **kwargs)
+    plot_step_series_styled(ax, time, values, label, style)
