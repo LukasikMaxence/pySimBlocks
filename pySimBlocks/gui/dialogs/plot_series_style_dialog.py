@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QVBoxLayout,
     QColorDialog,
@@ -49,6 +50,7 @@ class SeriesStyle:
     color: str = ""
     linestyle: str = "-"
     marker: str = ""
+    display_name: str = ""
 
 
 DEFAULT_SERIES_STYLE = SeriesStyle()
@@ -171,6 +173,16 @@ class SeriesStyleDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
+        layout.addWidget(QLabel(f"<b>Signal</b> (logged): <code>{series_label}</code>"))
+        layout.addWidget(QLabel("<b>Legend name</b> (empty = default label in plot)"))
+        self.display_name_edit = QLineEdit()
+        self.display_name_edit.setText(style.display_name)
+        self.display_name_edit.setPlaceholderText(series_label)
+        self.display_name_edit.setToolTip(
+            "Name shown in the legend and on curves. Leave empty to use the logged signal label."
+        )
+        layout.addWidget(self.display_name_edit)
+
         layout.addWidget(QLabel("<b>Marker</b> (None = no markers on the step curve)"))
         self.marker_combo = QComboBox()
         self.marker_combo.setEditable(True)
@@ -291,4 +303,5 @@ class SeriesStyleDialog(QDialog):
             color=self._resolved_color(),
             linestyle=str(linestyle) if linestyle is not None else "-",
             marker=self._marker_from_combo(),
+            display_name=self.display_name_edit.text().strip(),
         )

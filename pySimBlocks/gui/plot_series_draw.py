@@ -38,7 +38,8 @@ def plot_step_series(
 ) -> None:
     """Draw one step series on ``ax`` using optional line/marker/color style."""
     st = style or DEFAULT_SERIES_STYLE
-    kwargs: dict = {"where": "post", "label": label}
+    legend = st.display_name.strip() if st.display_name.strip() else label
+    kwargs: dict = {"where": "post", "label": legend}
     if st.color:
         kwargs["color"] = st.color
     if st.linestyle:

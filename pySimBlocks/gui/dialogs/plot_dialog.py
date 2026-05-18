@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout,
     QLabel, QTreeWidget, QTreeWidgetItem,
     QPushButton, QSizePolicy, QMessageBox, QComboBox, QToolButton, QMenu, QCheckBox,
-    QSpinBox, QHeaderView,
+    QSpinBox, QHeaderView, QLineEdit,
 )
 from PySide6.QtCore import Qt
 
@@ -77,6 +77,7 @@ class PlotDialog(QDialog):
         self._focused_panel_key: str | None = None
         self._axis_to_panel_key: dict[int, str] = {}
         self._manual_plot_selections: list[dict[str, set[str]]] = [{}]
+        self._manual_plot_titles: list[str] = ["Plot 1"]
         self._manual_active_plot = 0
         self._series_styles: dict[str, SeriesStyle] = {}
 
@@ -84,11 +85,18 @@ class PlotDialog(QDialog):
         self._populate_signals()
         self._populate_plot_presets()
         self._rebuild_manual_plot_combo()
+        self._load_active_manual_title()
         self._sync_manual_controls_enabled()
 
     # --------------------------------------------------------------------------
     # Private Methods
     # --------------------------------------------------------------------------
+    @staticmethod
+    def _disable_enter_key_activation(button: QPushButton) -> None:
+        """Prevent Enter in a nearby line edit from clicking this button."""
+        button.setAutoDefault(False)
+        button.setDefault(False)
+
     def _build_ui(self):
         """Build the plot dialog user interface."""
         main_layout = QHBoxLayout(self)
@@ -98,7 +106,7 @@ class PlotDialog(QDialog):
 
         left_layout.addWidget(QLabel("<b>Manual plots</b>"))
         manual_count_row = QHBoxLayout()
-        manual_count_row.addWidget(QLabel("Count:"))
+        manual_count_row.addWidget(QLabel("Number of plots:"))
         self.manual_plot_count_spin = QSpinBox()
         self.manual_plot_count_spin.setMinimum(1)
         self.manual_plot_count_spin.setMaximum(12)
@@ -110,17 +118,29 @@ class PlotDialog(QDialog):
         manual_count_row.addWidget(self.manual_plot_count_spin)
         left_layout.addLayout(manual_count_row)
 
-        manual_select_row = QHBoxLayout()
-        manual_select_row.addWidget(QLabel("Edit:"))
+        manual_plot_row = QHBoxLayout()
+        manual_plot_row.addWidget(QLabel("Plot:"))
         self.manual_plot_combo = QComboBox()
+        self.manual_plot_combo.setToolTip("Select which manual plot panel to configure")
         self.manual_plot_combo.currentIndexChanged.connect(self._on_manual_plot_combo_changed)
-        manual_select_row.addWidget(self.manual_plot_combo, 1)
-        left_layout.addLayout(manual_select_row)
+        manual_plot_row.addWidget(self.manual_plot_combo, 1)
+        left_layout.addLayout(manual_plot_row)
+
+        manual_edit_title_row = QHBoxLayout()
+        manual_edit_title_row.addWidget(QLabel("Title:"))
+        self.manual_plot_title_edit = QLineEdit()
+        self.manual_plot_title_edit.setPlaceholderText("Title shown on the selected plot")
+        self.manual_plot_title_edit.setToolTip("Title text for the plot selected in Plot")
+        self.manual_plot_title_edit.returnPressed.connect(self._on_manual_plot_title_edited)
+        self.manual_plot_title_edit.editingFinished.connect(self._on_manual_plot_title_edited)
+        manual_edit_title_row.addWidget(self.manual_plot_title_edit, 1)
+        left_layout.addLayout(manual_edit_title_row)
 
         self.manual_remove_plot_btn = QPushButton("Remove selected plot")
         self.manual_remove_plot_btn.setToolTip(
-            "Remove the plot selected in Edit and reduce the count by one."
+            "Remove the plot selected in Plot and reduce the count by one."
         )
+        self._disable_enter_key_activation(self.manual_remove_plot_btn)
         self.manual_remove_plot_btn.clicked.connect(self._on_manual_remove_selected_plot)
         left_layout.addWidget(self.manual_remove_plot_btn)
 
@@ -159,6 +179,7 @@ class PlotDialog(QDialog):
         left_layout.addLayout(subplot_row)
 
         self.plot_defined_btn = QPushButton("Plot defined plots")
+        self._disable_enter_key_activation(self.plot_defined_btn)
         self.plot_defined_btn.clicked.connect(self._plot_defined_plots)
         left_layout.addWidget(self.plot_defined_btn)
 
@@ -180,6 +201,7 @@ class PlotDialog(QDialog):
         self.legend_cb.setChecked(True)
         self.legend_cb.stateChanged.connect(self._update_preview_plot)
         self.autoscale_btn = QPushButton("Autoscale")
+        self._disable_enter_key_activation(self.autoscale_btn)
         self.autoscale_btn.clicked.connect(self._autoscale_preview)
         controls_layout.addWidget(self.grid_cb)
         controls_layout.addWidget(self.legend_cb)
@@ -207,7 +229,7 @@ class PlotDialog(QDialog):
                 self.signal_tree.addTopLevelItem(parent)
 
                 for label in self._component_labels_for_signal(sig):
-                    child = QTreeWidgetItem([label, ""])
+                    child = QTreeWidgetItem([self._tree_label_for_component(label), ""])
                     child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
                     child.setCheckState(0, Qt.Unchecked)
                     child.setData(0, Qt.UserRole, ("component", sig, label))
@@ -220,10 +242,27 @@ class PlotDialog(QDialog):
         """Return stored style for a series label, or the default."""
         return self._series_styles.get(label, DEFAULT_SERIES_STYLE)
 
+    def _tree_label_for_component(self, internal_label: str) -> str:
+        """Text shown in the signal tree for one component."""
+        name = self._get_series_style(internal_label).display_name.strip()
+        return name if name else internal_label
+
+    def _refresh_tree_component_label(self, internal_label: str) -> None:
+        """Update the signal tree row after a display name change."""
+        for i in range(self.signal_tree.topLevelItemCount()):
+            parent = self.signal_tree.topLevelItem(i)
+            for c in range(parent.childCount()):
+                child = parent.child(c)
+                data = child.data(0, Qt.UserRole)
+                if isinstance(data, tuple) and len(data) == 3 and str(data[2]) == internal_label:
+                    child.setText(0, self._tree_label_for_component(internal_label))
+                    return
+
     def _attach_style_button(self, item: QTreeWidgetItem, label: str) -> None:
         """Add a style editor button on the right of a signal tree row."""
         btn = QPushButton("⚙")
         btn.setFixedSize(30, 22)
+        self._disable_enter_key_activation(btn)
         btn.setToolTip(f"Line, marker, and color for « {label} »")
         btn.clicked.connect(lambda _checked=False, lbl=label: self._edit_series_style(lbl))
         self.signal_tree.setItemWidget(item, 1, btn)
@@ -235,6 +274,7 @@ class PlotDialog(QDialog):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._series_styles[label] = dlg.style()
+        self._refresh_tree_component_label(label)
         self._update_preview_plot()
 
     def _on_signal_toggled(self, _item: QTreeWidgetItem, _column: int):
@@ -286,15 +326,63 @@ class PlotDialog(QDialog):
         enabled = self._is_manual_mode()
         self.manual_plot_count_spin.setEnabled(enabled)
         self.manual_plot_combo.setEnabled(enabled)
+        self.manual_plot_title_edit.setEnabled(enabled)
         can_remove = enabled and self.manual_plot_count_spin.value() > 1
         self.manual_remove_plot_btn.setEnabled(can_remove)
 
+    @staticmethod
+    def _default_manual_plot_title(index: int) -> str:
+        return f"Plot {index + 1}"
+
+    def _ensure_manual_titles(self) -> None:
+        """Keep title list aligned with manual plot count."""
+        while len(self._manual_plot_titles) < len(self._manual_plot_selections):
+            i = len(self._manual_plot_titles)
+            self._manual_plot_titles.append(self._default_manual_plot_title(i))
+        if len(self._manual_plot_titles) > len(self._manual_plot_selections):
+            self._manual_plot_titles = self._manual_plot_titles[: len(self._manual_plot_selections)]
+
+    def _manual_plot_title(self, index: int) -> str:
+        """Return the axis title for one manual plot panel."""
+        self._ensure_manual_titles()
+        if 0 <= index < len(self._manual_plot_titles):
+            text = self._manual_plot_titles[index].strip()
+            if text:
+                return text
+        return self._default_manual_plot_title(index)
+
+    def _save_active_manual_title(self) -> None:
+        """Persist the title field into the active manual plot."""
+        if not self._manual_plot_selections:
+            return
+        self._ensure_manual_titles()
+        idx = min(self._manual_active_plot, len(self._manual_plot_titles) - 1)
+        self._manual_plot_titles[idx] = self.manual_plot_title_edit.text().strip()
+
+    def _load_active_manual_title(self) -> None:
+        """Load the active manual plot title into the title field."""
+        if not self._manual_plot_selections:
+            self.manual_plot_title_edit.clear()
+            return
+        self._ensure_manual_titles()
+        idx = min(self._manual_active_plot, len(self._manual_plot_titles) - 1)
+        self.manual_plot_title_edit.blockSignals(True)
+        self.manual_plot_title_edit.setText(self._manual_plot_titles[idx])
+        self.manual_plot_title_edit.blockSignals(False)
+
+    def _on_manual_plot_title_edited(self) -> None:
+        """Apply title edit and refresh preview and plot selector."""
+        self._save_active_manual_title()
+        self._rebuild_manual_plot_combo()
+        self._update_preview_plot()
+
     def _rebuild_manual_plot_combo(self) -> None:
         """Rebuild the manual plot selector from the current count."""
+        self._ensure_manual_titles()
         self.manual_plot_combo.blockSignals(True)
         self.manual_plot_combo.clear()
         for i in range(len(self._manual_plot_selections)):
-            self.manual_plot_combo.addItem(f"Plot {i + 1}", i)
+            self.manual_plot_combo.addItem(self._manual_plot_title(i), i)
         idx = min(self._manual_active_plot, max(0, len(self._manual_plot_selections) - 1))
         self._manual_active_plot = idx
         if self.manual_plot_combo.count() > 0:
@@ -304,16 +392,20 @@ class PlotDialog(QDialog):
     def _on_manual_plot_count_changed(self, value: int) -> None:
         """Grow or shrink manual plots; decreasing removes only the last plot."""
         self._save_active_manual_selection()
+        self._save_active_manual_title()
         old_count = len(self._manual_plot_selections)
         if value > old_count:
-            for _ in range(value - old_count):
+            for i in range(old_count, value):
                 self._manual_plot_selections.append({})
+                self._manual_plot_titles.append(self._default_manual_plot_title(i))
         elif value < old_count:
             self._manual_plot_selections = self._manual_plot_selections[:value]
+            self._manual_plot_titles = self._manual_plot_titles[:value]
             if self._manual_active_plot >= value:
                 self._manual_active_plot = max(0, value - 1)
         self._rebuild_manual_plot_combo()
         self._sync_manual_controls_enabled()
+        self._load_active_manual_title()
         self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
         self._update_preview_plot()
 
@@ -327,7 +419,9 @@ class PlotDialog(QDialog):
         if data == self._manual_active_plot:
             return
         self._save_active_manual_selection()
+        self._save_active_manual_title()
         self._manual_active_plot = data
+        self._load_active_manual_title()
         self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
         self._update_preview_plot()
 
@@ -335,8 +429,10 @@ class PlotDialog(QDialog):
         """Remove the plot currently selected for editing."""
         if len(self._manual_plot_selections) <= 1:
             return
+        self._save_active_manual_title()
         idx = self._manual_active_plot
         del self._manual_plot_selections[idx]
+        del self._manual_plot_titles[idx]
         new_count = len(self._manual_plot_selections)
         self.manual_plot_count_spin.blockSignals(True)
         self.manual_plot_count_spin.setValue(new_count)
@@ -345,6 +441,7 @@ class PlotDialog(QDialog):
             self._manual_active_plot = new_count - 1
         self._rebuild_manual_plot_combo()
         self._sync_manual_controls_enabled()
+        self._load_active_manual_title()
         self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
         self._update_preview_plot()
 
@@ -356,10 +453,12 @@ class PlotDialog(QDialog):
             self._update_preview_plot()
             return
         self._save_active_manual_selection()
+        self._save_active_manual_title()
         self._manual_active_plot = index
         self.manual_plot_combo.blockSignals(True)
         self.manual_plot_combo.setCurrentIndex(index)
         self.manual_plot_combo.blockSignals(False)
+        self._load_active_manual_title()
         self._load_manual_selection_to_tree(self._manual_plot_selections[index])
         self._update_preview_plot()
 
@@ -697,7 +796,7 @@ class PlotDialog(QDialog):
         try:
             for i, selection in enumerate(self._manual_plot_selections):
                 series = self._series_from_manual_selection(selection, time)
-                title = f"Plot {i + 1}"
+                title = self._manual_plot_title(i)
                 panels.append((title, f"manual::{i}", series))
         except Exception as e:
             ax = self.figure.add_subplot(111)
