@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout,
     QLabel, QTreeWidget, QTreeWidgetItem,
     QPushButton, QSizePolicy, QMessageBox, QComboBox, QToolButton, QMenu, QCheckBox,
-    QSpinBox,
+    QSpinBox, QHeaderView,
 )
 from PySide6.QtCore import Qt
 
@@ -37,6 +37,12 @@ from matplotlib.figure import Figure
 from pySimBlocks.gui.models.project_state import ProjectState
 from pySimBlocks.core.config import PlotConfig
 from pySimBlocks.project.plot_from_config import plot_from_config
+from pySimBlocks.gui.dialogs.plot_series_style_dialog import (
+    SeriesStyle,
+    SeriesStyleDialog,
+    DEFAULT_SERIES_STYLE,
+)
+from pySimBlocks.gui.plot_series_draw import plot_step_series
 
 
 class PlotDialog(QDialog):
@@ -72,6 +78,7 @@ class PlotDialog(QDialog):
         self._axis_to_panel_key: dict[int, str] = {}
         self._manual_plot_selections: list[dict[str, set[str]]] = [{}]
         self._manual_active_plot = 0
+        self._series_styles: dict[str, SeriesStyle] = {}
 
         self._build_ui()
         self._populate_signals()
@@ -121,7 +128,11 @@ class PlotDialog(QDialog):
         left_layout.addWidget(title)
 
         self.signal_tree = QTreeWidget()
-        self.signal_tree.setHeaderHidden(True)
+        self.signal_tree.setColumnCount(2)
+        self.signal_tree.setHeaderLabels(["Signal", ""])
+        self.signal_tree.setColumnWidth(1, 34)
+        self.signal_tree.header().setStretchLastSection(False)
+        self.signal_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.signal_tree.itemChanged.connect(self._on_signal_toggled)
         left_layout.addWidget(self.signal_tree)
 
@@ -196,13 +207,35 @@ class PlotDialog(QDialog):
                 self.signal_tree.addTopLevelItem(parent)
 
                 for label in self._component_labels_for_signal(sig):
-                    child = QTreeWidgetItem([f"   {label}"])
+                    child = QTreeWidgetItem([label, ""])
                     child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
                     child.setCheckState(0, Qt.Unchecked)
                     child.setData(0, Qt.UserRole, ("component", sig, label))
                     parent.addChild(child)
+                    self._attach_style_button(child, label)
         finally:
             self._updating_signal_tree = False
+
+    def _get_series_style(self, label: str) -> SeriesStyle:
+        """Return stored style for a series label, or the default."""
+        return self._series_styles.get(label, DEFAULT_SERIES_STYLE)
+
+    def _attach_style_button(self, item: QTreeWidgetItem, label: str) -> None:
+        """Add a style editor button on the right of a signal tree row."""
+        btn = QPushButton("⚙")
+        btn.setFixedSize(30, 22)
+        btn.setToolTip(f"Line, marker, and color for « {label} »")
+        btn.clicked.connect(lambda _checked=False, lbl=label: self._edit_series_style(lbl))
+        self.signal_tree.setItemWidget(item, 1, btn)
+
+    def _edit_series_style(self, label: str) -> None:
+        """Open the style dialog for one series component."""
+        current = self._series_styles.get(label, SeriesStyle())
+        dlg = SeriesStyleDialog(label, current, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._series_styles[label] = dlg.style()
+        self._update_preview_plot()
 
     def _on_signal_toggled(self, _item: QTreeWidgetItem, _column: int):
         """Redraw preview when signal/component check states change."""
@@ -635,7 +668,7 @@ class PlotDialog(QDialog):
         """Draw one manual plot panel and register it for hit-testing."""
         if series:
             for label, values in series:
-                ax.step(time, values, where="post", label=label)
+                plot_step_series(ax, time, values, label, self._get_series_style(label))
         else:
             ax.text(
                 0.5,
@@ -845,7 +878,7 @@ class PlotDialog(QDialog):
             ax = self.figure.add_subplot(111)
             title, key, series = panels[0]
             for label, values in series:
-                ax.step(time, values, where="post", label=label)
+                plot_step_series(ax, time, values, label, self._get_series_style(label))
             ax.set_title(title)
             self._style_axis(ax)
             self._axis_to_panel_key[id(ax)] = key
@@ -858,7 +891,7 @@ class PlotDialog(QDialog):
         for i, (title, key, series) in enumerate(panels):
             ax = axes[i]
             for label, values in series:
-                ax.step(time, values, where="post", label=label)
+                plot_step_series(ax, time, values, label, self._get_series_style(label))
             ax.set_title(title)
             self._style_axis(ax)
             self._axis_to_panel_key[id(ax)] = key
