@@ -164,10 +164,10 @@ class PlotDialog(QDialog):
         self.manual_remove_plot_btn.clicked.connect(self._on_manual_remove_selected_plot)
         left_layout.addWidget(self.manual_remove_plot_btn)
 
-        self.save_preset_btn = QPushButton("Save as plot preset")
+        self.save_preset_btn = QPushButton("Save plot preset")
         self.save_preset_btn.setToolTip(
-            "Save the current manual layout as one plot preset "
-            "(reload it later from Plot preset; persist with Ctrl+S)."
+            "Save the current manual layout as a plot preset. "
+            "Overwrites the selected preset or an existing preset with the same name."
         )
         self._disable_enter_key_activation(self.save_preset_btn)
         self.save_preset_btn.clicked.connect(self._save_manual_as_plot_preset)
@@ -394,7 +394,7 @@ class PlotDialog(QDialog):
         can_remove = enabled and self.manual_plot_count_spin.value() > 1
         self.manual_remove_plot_btn.setEnabled(can_remove)
         self.save_preset_btn.setEnabled(
-            self._is_manual_mode() and self.project_controller is not None
+            self._uses_manual_layout() and self.project_controller is not None
         )
 
     @staticmethod
@@ -606,20 +606,22 @@ class PlotDialog(QDialog):
         key = self._axis_to_panel_key.get(id(event.inaxes))
         if key is None:
             return
-        if self._is_manual_mode() and key.startswith("manual::"):
+        if self._uses_manual_layout() and key.startswith("manual::"):
             try:
                 plot_idx = int(key.split("::", 1)[1])
             except ValueError:
                 return
             if getattr(event, "dblclick", False):
+                self._select_manual_plot(plot_idx)
                 if self._focused_panel_key == key:
                     self._focused_panel_key = None
                 else:
                     self._focused_panel_key = key
-                self._select_manual_plot(plot_idx)
+                self._update_preview_plot()
                 return
             if self._focused_panel_key is not None:
-                return
+                self._focused_panel_key = None
+                self._update_preview_plot()
             self._select_manual_plot(plot_idx)
             return
         if not getattr(event, "dblclick", False):
@@ -637,8 +639,6 @@ class PlotDialog(QDialog):
         self.plot_preset_combo.addItem("Manual selection", None)
         for idx, plot in enumerate(self.project_state.plots):
             title = str(plot.get("title", f"Plot {idx + 1}"))
-            if is_manual_layout_plot(plot):
-                title = f"{title} (layout)"
             self.plot_preset_combo.addItem(title, idx)
         self.plot_preset_combo.setCurrentIndex(0)
         self.plot_preset_combo.blockSignals(False)
@@ -651,6 +651,16 @@ class PlotDialog(QDialog):
         data = self.plot_preset_combo.currentData()
         if isinstance(data, int):
             return data
+        return None
+
+    def _find_manual_preset_index_by_title(self, title: str) -> int | None:
+        """Return index of a manual layout preset with ``title``, or None."""
+        key = title.strip()
+        if not key:
+            return None
+        for idx, plot in enumerate(self.project_state.plots):
+            if is_manual_layout_plot(plot) and str(plot.get("title", "")).strip() == key:
+                return idx
         return None
 
     def _component_labels_for_signal(self, sig: str) -> list[str]:
@@ -1031,26 +1041,36 @@ class PlotDialog(QDialog):
         self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
 
     def _save_manual_as_plot_preset(self) -> None:
-        """Save the current manual layout as a single reloadable plot preset."""
-        if self.project_controller is None or not self._is_manual_mode():
+        """Save or overwrite a manual layout plot preset."""
+        if self.project_controller is None or not self._uses_manual_layout():
             return
 
         self._save_active_manual_selection()
         self._save_active_manual_title()
         self._ensure_manual_titles()
 
-        default_name = self._manual_plot_title(0) if self._manual_plot_titles else "Manual layout"
-        name, ok = QInputDialog.getText(
-            self,
-            "Save as plot preset",
-            "Preset name:",
-            text=default_name,
+        editing_idx = (
+            self._selected_preset_index() if self._is_manual_layout_preset() else None
         )
-        if not ok or not name.strip():
-            return
-
+        if editing_idx is not None:
+            preset_name = str(
+                self.project_state.plots[editing_idx].get("title", "Manual layout")
+            ).strip() or "Manual layout"
+        else:
+            default_name = (
+                self._manual_plot_title(0) if self._manual_plot_titles else "Manual layout"
+            )
+            name, ok = QInputDialog.getText(
+                self,
+                "Save plot preset",
+                "Preset name:",
+                text=default_name,
+            )
+            if not ok or not name.strip():
+                return
+            preset_name = name.strip()
         plot_dict = manual_layout_to_plot_dict(
-            name.strip(),
+            preset_name,
             self._manual_plot_titles,
             self._manual_plot_selections,
             self._series_styles,
@@ -1064,18 +1084,30 @@ class PlotDialog(QDialog):
             )
             return
 
-        new_index = self.project_controller.add_manual_layout_preset(plot_dict)
+        target_idx = editing_idx
+        if target_idx is None:
+            target_idx = self._find_manual_preset_index_by_title(preset_name)
+
+        created = target_idx is None
+        if target_idx is None:
+            target_idx = self.project_controller.add_manual_layout_preset(plot_dict)
+        else:
+            self.project_controller.update_manual_layout_preset(target_idx, plot_dict)
+
         self._populate_plot_presets()
+        combo_idx = self.plot_preset_combo.findData(target_idx)
         self.plot_preset_combo.blockSignals(True)
-        self.plot_preset_combo.setCurrentIndex(
-            self.plot_preset_combo.findData(new_index)
-        )
+        if combo_idx >= 0:
+            self.plot_preset_combo.setCurrentIndex(combo_idx)
         self.plot_preset_combo.blockSignals(False)
         self._on_plot_preset_changed(self.plot_preset_combo.currentIndex())
+
+        action = "added" if created else "updated"
         QMessageBox.information(
             self,
             "Plot preset saved",
-            f"Preset « {name.strip()} » added ({len(plot_dict.get('panels', []))} panels).\n"
+            f"Preset « {preset_name} » {action} "
+            f"({len(plot_dict.get('panels', []))} panels).\n"
             "Save the project (Ctrl+S) to write it to project.yaml.",
         )
 

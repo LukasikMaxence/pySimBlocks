@@ -395,6 +395,15 @@ class ProjectController(QObject):
         del self.project_state.plots[index]
         self.make_dirty()
 
+    def _ensure_logged_manual_layout(self, plot: dict) -> None:
+        """Ensure all signals referenced in a manual layout preset are logged."""
+        for panel in plot.get("panels", []):
+            if not isinstance(panel, dict):
+                continue
+            selection = panel.get("selection", {})
+            if isinstance(selection, dict):
+                self._ensure_logged(list(selection.keys()))
+
     def add_manual_layout_preset(self, plot: dict) -> int:
         """Append a manual multi-panel layout preset to the project.
 
@@ -404,15 +413,21 @@ class ProjectController(QObject):
         Returns:
             Index of the new preset in :attr:`ProjectState.plots`.
         """
-        for panel in plot.get("panels", []):
-            if not isinstance(panel, dict):
-                continue
-            selection = panel.get("selection", {})
-            if isinstance(selection, dict):
-                self._ensure_logged(list(selection.keys()))
+        self._ensure_logged_manual_layout(plot)
         self.project_state.plots.append(plot)
         self.make_dirty()
         return len(self.project_state.plots) - 1
+
+    def update_manual_layout_preset(self, index: int, plot: dict) -> None:
+        """Replace an existing manual layout preset at ``index``.
+
+        Args:
+            index: Index in :attr:`ProjectState.plots`.
+            plot: Plot descriptor with ``layout: manual`` and ``panels``.
+        """
+        self._ensure_logged_manual_layout(plot)
+        self.project_state.plots[index] = plot
+        self.make_dirty()
 
     def update_simulation_params(self, params: dict[str, float | str]) -> None:
         """Apply new simulation parameters to the project state.

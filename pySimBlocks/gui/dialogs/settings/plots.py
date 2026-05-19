@@ -129,10 +129,7 @@ class PlotSettingsWidget(QWidget):
         """Refresh the plot titles shown in the list widget."""
         self.plot_list.clear()
         for plot in self.project_state.plots:
-            title = plot["title"]
-            if is_manual_layout_plot(plot):
-                title = f"{title} (layout)"
-            self.plot_list.addItem(title)
+            self.plot_list.addItem(plot["title"])
 
     def populate_signal_list(self, checked=None):
         """Populate the signal checklist.
@@ -221,7 +218,7 @@ class PlotSettingsWidget(QWidget):
         if self.edit_index is not None and is_manual_layout_plot(self.project_state.plots[self.edit_index]):
             self.project_state.plots[self.edit_index]["title"] = title
             self.project_controller.make_dirty()
-            self.plot_list.item(self.edit_index).setText(f"{title} (layout)")
+            self.plot_list.item(self.edit_index).setText(title)
             self.update_buttons_state()
             return
 
