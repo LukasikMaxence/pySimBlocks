@@ -101,6 +101,13 @@ class PlotDialog(QDialog):
         self._load_active_manual_title()
         self._sync_manual_controls_enabled()
 
+    def present(self) -> None:
+        """Show this window and refresh the preview from the latest logs."""
+        self._update_preview_plot()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     # --------------------------------------------------------------------------
     # Private Methods
     # --------------------------------------------------------------------------

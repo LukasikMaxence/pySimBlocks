@@ -170,6 +170,7 @@ class ProjectSettingsWidget(QWidget):
             return 
         self.apply()
         self.project_controller.load_project(ProjectLoaderYaml())
+        main_window.on_project_loaded(self.project_state.directory_path)
         ext = self.project_state.external
         self.external_edit.setText("" if ext is None else ext)
         self.settings_dialog.refresh_tabs_from_project()

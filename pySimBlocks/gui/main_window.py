@@ -203,6 +203,7 @@ class MainWindow(QMainWindow):
         Args:
             project_path: Path to the newly loaded project directory.
         """
+        self.toolbar.discard_plot_dialog()
         self.update_window_title()
 
     def cleanup(self) -> None:
