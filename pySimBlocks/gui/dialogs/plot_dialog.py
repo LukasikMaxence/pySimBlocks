@@ -251,13 +251,18 @@ class PlotDialog(QDialog):
                 if sig == "time":
                     continue
 
+                labels = self._component_labels_for_signal(sig)
+                if len(labels) == 1:
+                    self._add_scalar_signal_tree_row(sig, labels[0])
+                    continue
+
                 parent = QTreeWidgetItem([sig])
                 parent.setFlags(parent.flags() | Qt.ItemIsUserCheckable)
                 parent.setCheckState(0, Qt.Unchecked)
                 parent.setData(0, Qt.UserRole, ("signal", sig))
                 self.signal_tree.addTopLevelItem(parent)
 
-                for label in self._component_labels_for_signal(sig):
+                for label in labels:
                     child = QTreeWidgetItem([self._tree_label_for_component(label), ""])
                     child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
                     child.setCheckState(0, Qt.Unchecked)
@@ -266,6 +271,15 @@ class PlotDialog(QDialog):
                     self._attach_style_button(child, label)
         finally:
             self._updating_signal_tree = False
+
+    def _add_scalar_signal_tree_row(self, sig: str, label: str) -> None:
+        """Add one top-level row for a scalar signal (single component, no expand)."""
+        item = QTreeWidgetItem([self._tree_label_for_component(label), ""])
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.Unchecked)
+        item.setData(0, Qt.UserRole, ("component", sig, label))
+        self.signal_tree.addTopLevelItem(item)
+        self._attach_style_button(item, label)
 
     def _get_series_style(self, label: str, plot: dict | None = None) -> SeriesStyle:
         """Return merged style for a series (session overrides, then plot config)."""
@@ -279,9 +293,15 @@ class PlotDialog(QDialog):
     def _refresh_tree_component_label(self, internal_label: str) -> None:
         """Update the signal tree row after a display name change."""
         for i in range(self.signal_tree.topLevelItemCount()):
-            parent = self.signal_tree.topLevelItem(i)
-            for c in range(parent.childCount()):
-                child = parent.child(c)
+            item = self.signal_tree.topLevelItem(i)
+            data = item.data(0, Qt.UserRole)
+            if isinstance(data, tuple) and len(data) == 3 and data[0] == "component":
+                if str(data[2]) == internal_label:
+                    item.setText(0, self._tree_label_for_component(internal_label))
+                    return
+                continue
+            for c in range(item.childCount()):
+                child = item.child(c)
                 data = child.data(0, Qt.UserRole)
                 if isinstance(data, tuple) and len(data) == 3 and str(data[2]) == internal_label:
                     child.setText(0, self._tree_label_for_component(internal_label))
@@ -522,14 +542,23 @@ class PlotDialog(QDialog):
         """Return selected component labels per signal from the tree widget."""
         selected: dict[str, set[str]] = {}
         for i in range(self.signal_tree.topLevelItemCount()):
-            parent = self.signal_tree.topLevelItem(i)
-            parent_data = parent.data(0, Qt.UserRole)
-            if not isinstance(parent_data, tuple) or len(parent_data) < 2:
+            item = self.signal_tree.topLevelItem(i)
+            item_data = item.data(0, Qt.UserRole)
+            if (
+                isinstance(item_data, tuple)
+                and len(item_data) == 3
+                and item_data[0] == "component"
+            ):
+                if item.checkState(0) == Qt.Checked:
+                    sig = str(item_data[1])
+                    selected.setdefault(sig, set()).add(str(item_data[2]))
                 continue
-            sig = str(parent_data[1])
+            if not isinstance(item_data, tuple) or len(item_data) < 2:
+                continue
+            sig = str(item_data[1])
             labels: set[str] = set()
-            for c in range(parent.childCount()):
-                child = parent.child(c)
+            for c in range(item.childCount()):
+                child = item.child(c)
                 if child.checkState(0) != Qt.Checked:
                     continue
                 child_data = child.data(0, Qt.UserRole)
@@ -544,15 +573,27 @@ class PlotDialog(QDialog):
         self._updating_signal_tree = True
         try:
             for i in range(self.signal_tree.topLevelItemCount()):
-                parent = self.signal_tree.topLevelItem(i)
-                parent_data = parent.data(0, Qt.UserRole)
-                if not isinstance(parent_data, tuple) or len(parent_data) < 2:
+                item = self.signal_tree.topLevelItem(i)
+                item_data = item.data(0, Qt.UserRole)
+                if (
+                    isinstance(item_data, tuple)
+                    and len(item_data) == 3
+                    and item_data[0] == "component"
+                ):
+                    sig = str(item_data[1])
+                    label = str(item_data[2])
+                    checked = label in selection.get(sig, set())
+                    item.setCheckState(
+                        0, Qt.Checked if checked else Qt.Unchecked
+                    )
                     continue
-                sig = str(parent_data[1])
+                if not isinstance(item_data, tuple) or len(item_data) < 2:
+                    continue
+                sig = str(item_data[1])
                 labels = selection.get(sig, set())
                 checked_count = 0
-                for c in range(parent.childCount()):
-                    child = parent.child(c)
+                for c in range(item.childCount()):
+                    child = item.child(c)
                     child_data = child.data(0, Qt.UserRole)
                     if not isinstance(child_data, tuple) or len(child_data) != 3:
                         continue
@@ -562,11 +603,11 @@ class PlotDialog(QDialog):
                         checked_count += 1
                     else:
                         child.setCheckState(0, Qt.Unchecked)
-                n_children = parent.childCount()
+                n_children = item.childCount()
                 if checked_count == n_children and n_children > 0:
-                    parent.setCheckState(0, Qt.Checked)
+                    item.setCheckState(0, Qt.Checked)
                 else:
-                    parent.setCheckState(0, Qt.Unchecked)
+                    item.setCheckState(0, Qt.Unchecked)
         finally:
             self._updating_signal_tree = False
 
