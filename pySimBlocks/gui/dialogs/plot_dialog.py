@@ -79,9 +79,15 @@ class PlotDialog(QDialog):
         self.project_controller = project_controller
         self.setWindowTitle("Plot signals")
         self.resize(900, 500)
-        self.setWindowFlag(Qt.Window, True)
-        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
-        self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
+        # fix fullscreen and minimize button not being available on certain environments
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowCloseButtonHint
+        )
 
         self.project_state = project_state
         self._subplot_items: list[tuple[str, str]] = []
