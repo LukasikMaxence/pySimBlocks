@@ -40,15 +40,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
-from pySimBlocks.project.plot_series_helpers import (
+from pySimBlocks.project.plot_series import (
     DEFAULT_SERIES_STYLE,
     SeriesStyle,
     is_usable_line_marker,
     normalize_marker_code,
     normalize_plot_marker,
 )
-
-_SKIP_MARKERS = frozenset({"", " ", "None", "none"})
 
 
 def marker_display_label(marker: str) -> str:

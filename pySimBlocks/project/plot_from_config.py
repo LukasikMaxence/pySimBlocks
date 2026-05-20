@@ -25,67 +25,16 @@ import matplotlib.pyplot as plt
 from matplotlib import gridspec
 
 from pySimBlocks.core.config import PlotConfig
-from pySimBlocks.project.plot_series_helpers import (
+from pySimBlocks.project.plot_series import (
     effective_style_for_component,
     flatten_series,
     is_manual_layout_plot,
     plot_step_series_styled,
     resolve_series_style,
     selection_from_panel_dict,
+    series_from_signal,
 )
 
-
-def _stack_logged_signal(logs: dict, sig: str) -> np.ndarray:
-    """Stack a logged signal over time into a (T, m, n) array."""
-    samples = logs[sig]
-    if not isinstance(samples, list) or len(samples) == 0:
-        raise ValueError(f"Signal '{sig}' has no samples in logs.")
-
-    first = None
-    for s in samples:
-        if s is not None:
-            first = np.asarray(s)
-            break
-
-    if first is None:
-        raise ValueError(f"Signal '{sig}' is always None; cannot plot.")
-
-    if first.ndim != 2:
-        raise ValueError(f"Signal '{sig}' must be 2D. Got ndim={first.ndim} with shape {first.shape}.")
-
-    shape0 = first.shape
-
-    stacked = []
-    for k, s in enumerate(samples):
-        if s is None:
-            raise ValueError(f"Signal '{sig}' contains None at index {k}; cannot plot.")
-        a = np.asarray(s)
-        if a.ndim != 2:
-            raise ValueError(
-                f"Signal '{sig}' sample {k} must be 2D. Got ndim={a.ndim} with shape {a.shape}."
-            )
-        if a.shape != shape0:
-            raise ValueError(
-                f"Signal '{sig}' shape changed over time: expected {shape0}, got {a.shape} at sample {k}."
-            )
-        stacked.append(a)
-
-    data = np.stack(stacked, axis=0)
-    return data
-
-
-def _series_from_signal(logs: dict, sig: str) -> list[tuple[str, np.ndarray]]:
-    """Return flat (label, values) series for one signal."""
-    data = _stack_logged_signal(logs, sig)
-    m, n = data.shape[1], data.shape[2]
-
-    if (m, n) == (1, 1):
-        return [(sig, data[:, 0, 0])]
-
-    if n == 1:
-        return [(f"{sig}[{i}]", data[:, i, 0]) for i in range(m)]
-
-    return [(f"{sig}[{r},{c}]", data[:, r, c]) for r in range(m) for c in range(n)]
 
 
 def _resolve_plot_mode(plot: dict, total_series: int, signal_count: int) -> str:
@@ -123,22 +72,14 @@ def _series_from_manual_panel(
     T = len(time)
     series: list[tuple[str, np.ndarray]] = []
     for sig in sorted(selection.keys()):
-        data = _stack_logged_signal(logs, sig)
-        if data.shape[0] != T:
+        sig_series = series_from_signal(logs, sig)
+        n_samples = len(sig_series[0][1]) if sig_series else 0
+        if n_samples != T:
             raise ValueError(
-                f"Time length mismatch for '{sig}': time has {T} samples but signal has {data.shape[0]}."
+                f"Time length mismatch for '{sig}': time has {T} samples but signal has {n_samples}."
             )
-        m, n = data.shape[1], data.shape[2]
-        if (m, n) == (1, 1):
-            candidates = [(sig, data[:, 0, 0])]
-        elif n == 1:
-            candidates = [(f"{sig}[{i}]", data[:, i, 0]) for i in range(m)]
-        else:
-            candidates = [
-                (f"{sig}[{r},{c}]", data[:, r, c]) for r in range(m) for c in range(n)
-            ]
         selected_labels = selection[sig]
-        for label, values in candidates:
+        for label, values in sig_series:
             if label in selected_labels:
                 series.append((label, values))
     return series
@@ -282,12 +223,13 @@ def plot_from_config(
         series_by_signal: list[tuple[str, list[tuple[str, np.ndarray]]]] = []
 
         for sig in signals:
-            data = _stack_logged_signal(logs, sig)
-            if data.shape[0] != T:
+            sig_series = series_from_signal(logs, sig)
+            n_samples = len(sig_series[0][1]) if sig_series else 0
+            if n_samples != T:
                 raise ValueError(
-                    f"Time length mismatch for '{sig}': time has {T} samples but signal has {data.shape[0]}."
+                    f"Time length mismatch for '{sig}': time has {T} samples but signal has {n_samples}."
                 )
-            series_by_signal.append((sig, _series_from_signal(logs, sig)))
+            series_by_signal.append((sig, sig_series))
 
         flat_series = flatten_series(series_by_signal)
         mode = _resolve_plot_mode(plot, total_series=len(flat_series), signal_count=len(signals))
