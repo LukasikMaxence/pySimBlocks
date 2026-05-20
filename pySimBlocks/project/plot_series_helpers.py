@@ -102,6 +102,16 @@ def series_style_from_dict(data: dict[str, Any] | None) -> SeriesStyle:
     )
 
 
+def merge_series_styles(primary: SeriesStyle, fallback: SeriesStyle) -> SeriesStyle:
+    """Merge two styles; non-empty fields in ``primary`` override ``fallback``."""
+    return SeriesStyle(
+        color=primary.color or fallback.color,
+        linestyle=primary.linestyle or fallback.linestyle,
+        marker=primary.marker or fallback.marker,
+        display_name=primary.display_name or fallback.display_name,
+    )
+
+
 def resolve_series_style(
     label: str,
     session_styles: dict[str, SeriesStyle],
@@ -112,12 +122,20 @@ def resolve_series_style(
     session = session_styles.get(label)
     if session is None:
         return from_plot
-    return SeriesStyle(
-        color=session.color or from_plot.color,
-        linestyle=session.linestyle or from_plot.linestyle,
-        marker=session.marker or from_plot.marker,
-        display_name=session.display_name or from_plot.display_name,
-    )
+    return merge_series_styles(session, from_plot)
+
+
+def effective_style_for_component(
+    plot: dict | None,
+    panel: dict | None,
+    label: str,
+) -> SeriesStyle:
+    """Style for one component label: panel ``series_styles`` overrides plot-level."""
+    plot = plot or {}
+    panel = panel or {}
+    base = series_style_from_dict(plot.get("series_styles", {}).get(label))
+    override = series_style_from_dict(panel.get("series_styles", {}).get(label))
+    return merge_series_styles(override, base)
 
 
 def filter_series_by_signal(
@@ -176,12 +194,26 @@ def is_manual_layout_plot(plot: dict) -> bool:
     return str(plot.get("layout", "")).strip().lower() == MANUAL_LAYOUT_KEY
 
 
-def panel_dict_from_selection(title: str, selection: dict[str, set[str]]) -> dict[str, Any]:
+def panel_dict_from_selection(
+    title: str,
+    selection: dict[str, set[str]],
+    series_styles: dict[str, SeriesStyle] | None = None,
+) -> dict[str, Any]:
     """Serialize one manual panel for YAML storage."""
-    return {
+    out: dict[str, Any] = {
         "title": title.strip() or "Plot",
         "selection": {sig: sorted(labels) for sig, labels in selection.items()},
     }
+    if not series_styles:
+        return out
+    serialized: dict[str, dict[str, str]] = {}
+    for lbl, st in series_styles.items():
+        data = series_style_to_dict(st)
+        if data:
+            serialized[str(lbl)] = data
+    if serialized:
+        out["series_styles"] = serialized
+    return out
 
 
 def selection_from_panel_dict(panel: dict) -> dict[str, set[str]]:
@@ -207,51 +239,56 @@ def manual_layout_to_plot_dict(
     preset_title: str,
     panel_titles: list[str],
     panel_selections: list[dict[str, set[str]]],
-    session_styles: dict[str, SeriesStyle],
+    panel_styles: list[dict[str, SeriesStyle]],
 ) -> dict[str, Any] | None:
-    """Build one plot preset that stores a full manual multi-panel layout."""
+    """Build one plot preset that stores a full manual multi-panel layout.
+
+    Each entry in ``panel_styles`` holds styles for component labels in that
+    panel only (name, color, etc. may differ per panel for the same signal).
+    """
     panels: list[dict[str, Any]] = []
-    all_labels: set[str] = set()
-    for title, selection in zip(panel_titles, panel_selections):
+    for i, (title, selection) in enumerate(zip(panel_titles, panel_selections)):
         if not selection:
             continue
-        panels.append(panel_dict_from_selection(title, selection))
+        ps = panel_styles[i] if i < len(panel_styles) else {}
+        picked: dict[str, SeriesStyle] = {}
         for labels in selection.values():
-            all_labels.update(labels)
+            for lbl in labels:
+                sl = str(lbl)
+                if sl in ps:
+                    picked[sl] = ps[sl]
+        panels.append(panel_dict_from_selection(title, selection, picked))
     if not panels:
         return None
-    plot: dict[str, Any] = {
+    return {
         "title": preset_title.strip() or "Manual layout",
         "layout": MANUAL_LAYOUT_KEY,
         "panels": panels,
     }
-    series_styles: dict[str, dict[str, str]] = {}
-    for lbl in sorted(all_labels):
-        style_dict = series_style_to_dict(session_styles.get(lbl, SeriesStyle()))
-        if style_dict:
-            series_styles[lbl] = style_dict
-    if series_styles:
-        plot["series_styles"] = series_styles
-    return plot
 
 
 def manual_state_from_layout_plot(
     plot: dict,
-) -> tuple[list[dict[str, set[str]]], list[str], dict[str, SeriesStyle]]:
-    """Extract manual panel state from a layout preset."""
+) -> tuple[list[dict[str, set[str]]], list[str], list[dict[str, SeriesStyle]]]:
+    """Extract manual panel state from a layout preset.
+
+    Returns one style map per panel (merged plot-level + panel-level YAML).
+    """
     panels_raw = plot.get("panels", [])
     selections: list[dict[str, set[str]]] = []
     titles: list[str] = []
+    per_panel_styles: list[dict[str, SeriesStyle]] = []
     if isinstance(panels_raw, list):
         for i, panel in enumerate(panels_raw):
             if not isinstance(panel, dict):
                 continue
             titles.append(str(panel.get("title", f"Plot {i + 1}")))
-            selections.append(selection_from_panel_dict(panel))
-    styles: dict[str, SeriesStyle] = {}
-    raw_styles = plot.get("series_styles", {})
-    if isinstance(raw_styles, dict):
-        for lbl, cfg in raw_styles.items():
-            if isinstance(cfg, dict):
-                styles[str(lbl)] = series_style_from_dict(cfg)
-    return selections, titles, styles
+            sel = selection_from_panel_dict(panel)
+            selections.append(sel)
+            merged: dict[str, SeriesStyle] = {}
+            for labels in sel.values():
+                for lbl in labels:
+                    sl = str(lbl)
+                    merged[sl] = effective_style_for_component(plot, panel, sl)
+            per_panel_styles.append(merged)
+    return selections, titles, per_panel_styles

@@ -22,13 +22,16 @@ from __future__ import annotations
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import gridspec
 
 from pySimBlocks.core.config import PlotConfig
 from pySimBlocks.project.plot_series_helpers import (
+    effective_style_for_component,
     flatten_series,
     is_manual_layout_plot,
     plot_step_series_styled,
     resolve_series_style,
+    selection_from_panel_dict,
 )
 
 
@@ -111,6 +114,104 @@ def _style_axes(ax: plt.Axes, title: str, show_legend: bool) -> None:
         ax.legend()
 
 
+def _series_from_manual_panel(
+    logs: dict,
+    selection: dict[str, set[str]],
+    time: np.ndarray,
+) -> list[tuple[str, np.ndarray]]:
+    """Build (label, values) series for one manual panel selection."""
+    T = len(time)
+    series: list[tuple[str, np.ndarray]] = []
+    for sig in sorted(selection.keys()):
+        data = _stack_logged_signal(logs, sig)
+        if data.shape[0] != T:
+            raise ValueError(
+                f"Time length mismatch for '{sig}': time has {T} samples but signal has {data.shape[0]}."
+            )
+        m, n = data.shape[1], data.shape[2]
+        if (m, n) == (1, 1):
+            candidates = [(sig, data[:, 0, 0])]
+        elif n == 1:
+            candidates = [(f"{sig}[{i}]", data[:, i, 0]) for i in range(m)]
+        else:
+            candidates = [
+                (f"{sig}[{r},{c}]", data[:, r, c]) for r in range(m) for c in range(n)
+            ]
+        selected_labels = selection[sig]
+        for label, values in candidates:
+            if label in selected_labels:
+                series.append((label, values))
+    return series
+
+
+def _plot_manual_layout_figure(logs: dict, time: np.ndarray, plot: dict) -> None:
+    """Render one figure for a ``layout: manual`` plot descriptor."""
+    panels_raw = plot.get("panels")
+    if not isinstance(panels_raw, list) or not panels_raw:
+        return
+    panel_blocks: list[tuple[str, list[tuple[str, np.ndarray]], dict]] = []
+    for i, panel in enumerate(panels_raw):
+        if not isinstance(panel, dict):
+            continue
+        ptitle = str(panel.get("title", f"Plot {i + 1}"))
+        sel = selection_from_panel_dict(panel)
+        if not sel:
+            panel_blocks.append((ptitle, [], panel))
+            continue
+        try:
+            ser = _series_from_manual_panel(logs, sel, time)
+        except Exception:
+            ser = []
+        panel_blocks.append((ptitle, ser, panel))
+    if not panel_blocks:
+        return
+    n_plots = len(panel_blocks)
+    fig = plt.figure()
+    if n_plots == 1:
+        ptitle, series, panel = panel_blocks[0]
+        ax = fig.add_subplot(111)
+        if series:
+            for label, values in series:
+                st = effective_style_for_component(plot, panel, label)
+                plot_step_series_styled(ax, time, values, label, st)
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No signals selected.",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+        _style_axes(ax, str(plot.get("title", "")) or ptitle, True)
+        fig.tight_layout()
+        return
+    n_rows = (n_plots + 1) // 2
+    gs = gridspec.GridSpec(n_rows, 2, figure=fig)
+    fig_title = str(plot.get("title", "") or "")
+    for i, (ptitle, series, panel) in enumerate(panel_blocks):
+        if i == n_plots - 1 and n_plots % 2 == 1:
+            ax = fig.add_subplot(gs[i // 2, :])
+        else:
+            ax = fig.add_subplot(gs[i // 2, i % 2])
+        if series:
+            for label, values in series:
+                st = effective_style_for_component(plot, panel, label)
+                plot_step_series_styled(ax, time, values, label, st)
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No signals selected.",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+        stitle = f"{fig_title} — {ptitle}" if fig_title else ptitle
+        _style_axes(ax, stitle, True)
+    fig.tight_layout()
+
+
 def plot_from_config(
     logs: dict,
     plot_cfg: PlotConfig | None,
@@ -142,7 +243,15 @@ def plot_from_config(
 
     requested_signals = set()
     for plot in plot_cfg.plots:
-        requested_signals.update(plot["signals"])
+        if is_manual_layout_plot(plot):
+            for panel in plot.get("panels") or []:
+                if not isinstance(panel, dict):
+                    continue
+                sel = panel.get("selection")
+                if isinstance(sel, dict):
+                    requested_signals.update(str(k) for k in sel.keys())
+            continue
+        requested_signals.update(plot.get("signals") or [])
 
     available_signals = set(logs.keys())
     available_signals.discard("time")
@@ -166,6 +275,7 @@ def plot_from_config(
 
     for plot in plot_cfg.plots:
         if is_manual_layout_plot(plot):
+            _plot_manual_layout_figure(logs, time, plot)
             continue
         title = plot.get("title", "")
         signals = plot["signals"]
