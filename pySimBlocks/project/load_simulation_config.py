@@ -58,10 +58,18 @@ def _load_external_module(path: Path):
 
 
 _EXTERNAL_REF_PATTERN = re.compile(r"#([A-Za-z_][A-Za-z0-9_]*)")
+_HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{3,8}$")
+
+
+def _is_hex_color_literal(value: str) -> bool:
+    """Return True if ``value`` is a CSS/matplotlib ``#rgb`` / ``#rrggbb`` color."""
+    return bool(_HEX_COLOR_PATTERN.match(value.strip()))
 
 
 def extract_external_refs(expr: str) -> set[str]:
     """Extract all external reference names (``#var`` syntax) from an expression string.
+
+    Hex color literals (e.g. ``#d62728`` in plot ``series_styles``) are ignored.
 
     Args:
         expr: A YAML value string potentially containing ``#name`` references.
@@ -69,6 +77,8 @@ def extract_external_refs(expr: str) -> set[str]:
     Returns:
         Set of referenced variable names with the ``#`` prefix stripped.
     """
+    if _is_hex_color_literal(expr):
+        return set()
     return set(_EXTERNAL_REF_PATTERN.findall(expr))
 
 
@@ -131,6 +141,8 @@ def eval_value(value: Any, scope: dict) -> Any:
     Returns:
         Evaluated Python object, or ``value`` unchanged if evaluation fails.
     """
+    if isinstance(value, str) and _is_hex_color_literal(value):
+        return value
     try:
         expr = str(value)
         expr = expr.replace("#", "")

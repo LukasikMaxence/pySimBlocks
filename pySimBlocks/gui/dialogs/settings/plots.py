@@ -20,12 +20,13 @@
 
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem,
-    QLabel, QLineEdit, QPushButton, QMessageBox
+    QLabel, QLineEdit, QPushButton, QMessageBox, QComboBox
 )
 from PySide6.QtCore import Qt
 
 from pySimBlocks.gui.models.project_state import ProjectState
 from pySimBlocks.gui.project_controller import ProjectController
+from pySimBlocks.project.plot_series_helpers import is_manual_layout_plot
 
 
 class PlotSettingsWidget(QWidget):
@@ -88,6 +89,18 @@ class PlotSettingsWidget(QWidget):
         self.title_edit = QLineEdit()
         right.addWidget(self.title_edit)
 
+        right.addWidget(QLabel("Display mode:"))
+        self.mode_combo = QComboBox()
+        self._mode_items = [
+            ("Auto (recommended)", "auto"),
+            ("Overlay (single axis)", "overlay"),
+            ("Split by signal", "split_signals"),
+            ("Split by component", "split_components"),
+        ]
+        for label, key in self._mode_items:
+            self.mode_combo.addItem(label, key)
+        right.addWidget(self.mode_combo)
+
         right.addWidget(QLabel("Signals:"))
         self.signal_list = QListWidget()
         self.signal_list.setSelectionMode(QListWidget.NoSelection)
@@ -148,6 +161,7 @@ class PlotSettingsWidget(QWidget):
     def reset_form(self):
         """Clear the editor fields and uncheck all signals."""
         self.title_edit.clear()
+        self.mode_combo.setCurrentIndex(0)
         self.populate_signal_list()
 
     def update_buttons_state(self):
@@ -170,6 +184,19 @@ class PlotSettingsWidget(QWidget):
         self.edit_index = index
         plot = self.project_state.plots[index]
         self.title_edit.setText(plot["title"])
+        if is_manual_layout_plot(plot):
+            self.mode_combo.setCurrentIndex(0)
+            self.signal_list.clear()
+            n_panels = len(plot.get("panels", []))
+            item = QListWidgetItem(
+                f"Manual layout ({n_panels} panels) — edit in the Plot dialog"
+            )
+            item.setFlags(Qt.NoItemFlags)
+            self.signal_list.addItem(item)
+            self.update_buttons_state()
+            return
+        mode = str(plot.get("mode", "auto"))
+        self._set_mode_combo(mode)
         self.populate_signal_list(plot["signals"])
         self.update_buttons_state()
 
@@ -188,16 +215,27 @@ class PlotSettingsWidget(QWidget):
             QMessageBox.warning(self, "Invalid plot", "Plot title cannot be empty.")
             return
 
+        if self.edit_index is not None and is_manual_layout_plot(self.project_state.plots[self.edit_index]):
+            self.project_state.plots[self.edit_index]["title"] = title
+            self.project_controller.make_dirty()
+            self.plot_list.item(self.edit_index).setText(title)
+            self.update_buttons_state()
+            return
+
         signals = self.collect_selected_signals()
         if not signals:
             QMessageBox.warning(self, "Invalid plot", "No signal selected.")
             return
 
+        mode = self.mode_combo.currentData()
+        if mode is None:
+            mode = "auto"
+
         if self.edit_index is None:
-            self.project_controller.create_plot(title, signals)
+            self.project_controller.create_plot(title, signals, mode=mode)
             self.refresh_plot_list()
         else:
-            self.project_controller.update_plot(self.edit_index, title, signals)
+            self.project_controller.update_plot(self.edit_index, title, signals, mode=mode)
             self.plot_list.item(self.edit_index).setText(title)
 
         self.update_buttons_state()
@@ -214,3 +252,15 @@ class PlotSettingsWidget(QWidget):
         self.plot_list.clearSelection()
         self.reset_form()
         self.update_buttons_state()
+
+    # --------------------------------------------------------------------------
+    # Private helpers
+    # --------------------------------------------------------------------------
+    def _set_mode_combo(self, mode: str) -> None:
+        """Select mode in combo, fallback to ``auto`` for unknown values."""
+        idx = self.mode_combo.findData(mode)
+        if idx < 0:
+            idx = self.mode_combo.findData("auto")
+        if idx < 0:
+            idx = 0
+        self.mode_combo.setCurrentIndex(idx)

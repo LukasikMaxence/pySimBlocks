@@ -92,12 +92,36 @@ class PlotConfig:
 
     def validate(self) -> None:
         """Verify that each plot descriptor has the required fields.
- 
+
+        Classic plots require ``signals``. Manual layout presets use
+        ``layout: manual`` with a ``panels`` list instead.
+
         Raises:
-            ValueError: If a plot descriptor is missing ``"signals"`` or
-                if ``"signals"`` is not a list.
+            ValueError: If a plot descriptor is invalid.
         """
         for i, plot in enumerate(self.plots):
+            layout = str(plot.get("layout", "")).strip().lower()
+            if layout == "manual":
+                panels = plot.get("panels")
+                if not isinstance(panels, list) or not panels:
+                    raise ValueError(
+                        f"Plot #{i} (layout: manual) must define a non-empty 'panels' list"
+                    )
+                for j, panel in enumerate(panels):
+                    if not isinstance(panel, dict):
+                        raise ValueError(
+                            f"Plot #{i} panel #{j} must be a mapping"
+                        )
+                    selection = panel.get("selection")
+                    if isinstance(selection, dict) and selection:
+                        continue
+                    signals = panel.get("signals")
+                    if isinstance(signals, list) and signals:
+                        continue
+                    raise ValueError(
+                        f"Plot #{i} panel #{j} must define 'selection' or 'signals'"
+                    )
+                continue
             if "signals" not in plot:
                 raise ValueError(
                     f"Plot #{i} is missing required field 'signals'"

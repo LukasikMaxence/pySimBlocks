@@ -196,7 +196,7 @@ class BlockItem(QGraphicsRectItem):
 
         rect = self.rect()
 
-        # --- Nom (centré, police normale)
+        # name (centered, normal font)
         name_font = QFont("Sans Serif", 9)
         painter.setFont(name_font)
         painter.setPen(t.text_selected if selected else t.text)
@@ -204,7 +204,7 @@ class BlockItem(QGraphicsRectItem):
         name_rect = QRectF(rect.x(), rect.y(), rect.width(), rect.height() * 0.60)
         painter.drawText(name_rect, Qt.AlignCenter | Qt.AlignBottom, self.instance.name)
 
-        # --- Type (petite police, italique, couleur atténuée) — uniquement si assez de place
+        # type (small font, italic, muted color) - only if enough space
         if rect.height() >= self.TYPE_LABEL_MIN_HEIGHT:
             type_font = QFont("Sans Serif", 8)
             type_font.setItalic(True)
@@ -214,7 +214,7 @@ class BlockItem(QGraphicsRectItem):
             type_rect = QRectF(rect.x(), rect.y() + rect.height() * 0.58, rect.width(), rect.height() * 0.38)
             painter.drawText(type_rect, Qt.AlignCenter | Qt.AlignTop, self.instance.meta.type)
 
-        # --- Handles de sélection
+        # selection handlers
         if selected:
             half = self.SELECTION_HANDLE_SIZE / 2
             r = self.rect()

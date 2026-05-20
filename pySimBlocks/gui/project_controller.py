@@ -344,22 +344,32 @@ class ProjectController(QObject):
     # Plot methods
     # --------------------------------------------------------------------------
 
-    def create_plot(self, title: str, signals: list[str]) -> None:
+    def create_plot(self, title: str, signals: list[str], mode: str = "auto") -> None:
         """Append a new plot to the project configuration.
 
         Args:
             title: Title of the plot figure.
             signals: List of signal names to display in the plot. Any signal
                 not already logged is automatically added to the logging list.
+            mode: Plot display mode (``auto``, ``overlay``, ``split_signals``,
+                or ``split_components``).
         """
         self._ensure_logged(signals)
         self.project_state.plots.append({
             "title": title,
             "signals": list(signals),
+            "mode": mode,
         })
         self.make_dirty()
 
-    def update_plot(self, index: int, title: str, signals: list[str]) -> None:
+    def update_plot(
+        self,
+        index: int,
+        title: str,
+        signals: list[str],
+        mode: str = "auto",
+        series_styles: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         """Update the title and signals of an existing plot.
 
         Args:
@@ -367,13 +377,28 @@ class ProjectController(QObject):
             title: New title for the plot.
             signals: New list of signal names. Any signal not yet logged is
                 automatically added.
+            mode: Plot display mode (``auto``, ``overlay``, ``split_signals``,
+                or ``split_components``).
+            series_styles: Optional per-component style map for YAML storage.
         """
         self._ensure_logged(signals)
         plot = self.project_state.plots[index]
-        if plot["signals"] == signals and plot["title"] == title:
+        styles_unchanged = series_styles is None or plot.get("series_styles") == series_styles
+        if (
+            plot["signals"] == signals
+            and plot["title"] == title
+            and str(plot.get("mode", "auto")) == mode
+            and styles_unchanged
+        ):
             return
         plot["title"] = title
         plot["signals"] = list(signals)
+        plot["mode"] = mode
+        if series_styles is not None:
+            if series_styles:
+                plot["series_styles"] = series_styles
+            else:
+                plot.pop("series_styles", None)
         self.make_dirty()
 
     def delete_plot(self, index: int) -> None:
@@ -383,6 +408,40 @@ class ProjectController(QObject):
             index: Index of the plot in :attr:`ProjectState.plots`.
         """
         del self.project_state.plots[index]
+        self.make_dirty()
+
+    def _ensure_logged_manual_layout(self, plot: dict) -> None:
+        """Ensure all signals referenced in a manual layout preset are logged."""
+        for panel in plot.get("panels", []):
+            if not isinstance(panel, dict):
+                continue
+            selection = panel.get("selection", {})
+            if isinstance(selection, dict):
+                self._ensure_logged(list(selection.keys()))
+
+    def add_manual_layout_preset(self, plot: dict) -> int:
+        """Append a manual multi-panel layout preset to the project.
+
+        Args:
+            plot: Plot descriptor with ``layout: manual`` and ``panels``.
+
+        Returns:
+            Index of the new preset in :attr:`ProjectState.plots`.
+        """
+        self._ensure_logged_manual_layout(plot)
+        self.project_state.plots.append(plot)
+        self.make_dirty()
+        return len(self.project_state.plots) - 1
+
+    def update_manual_layout_preset(self, index: int, plot: dict) -> None:
+        """Replace an existing manual layout preset at ``index``.
+
+        Args:
+            index: Index in :attr:`ProjectState.plots`.
+            plot: Plot descriptor with ``layout: manual`` and ``panels``.
+        """
+        self._ensure_logged_manual_layout(plot)
+        self.project_state.plots[index] = plot
         self.make_dirty()
 
     def update_simulation_params(self, params: dict[str, float | str]) -> None:
@@ -457,6 +516,41 @@ class ProjectController(QObject):
 
         for i in reversed(range(len(self.project_state.plots))):
             plot = self.project_state.plots[i]
+            if str(plot.get("layout", "")).strip().lower() == "manual":
+                panels = plot.get("panels", [])
+                if not isinstance(panels, list):
+                    continue
+                kept_panels = []
+                for panel in panels:
+                    if not isinstance(panel, dict):
+                        continue
+                    selection = panel.get("selection")
+                    if isinstance(selection, dict):
+                        new_sel = {
+                            sig: [lbl for lbl in labels if lbl not in removed_signals]
+                            for sig, labels in selection.items()
+                            if sig not in removed_signals
+                        }
+                        new_sel = {sig: labels for sig, labels in new_sel.items() if labels}
+                        if new_sel:
+                            panel = dict(panel)
+                            panel["selection"] = new_sel
+                            kept_panels.append(panel)
+                        continue
+                    signals = panel.get("signals", [])
+                    if isinstance(signals, list):
+                        signals = [s for s in signals if s not in removed_signals]
+                        if signals:
+                            panel = dict(panel)
+                            panel["signals"] = signals
+                            kept_panels.append(panel)
+                if kept_panels:
+                    plot["panels"] = kept_panels
+                else:
+                    del self.project_state.plots[i]
+                continue
+            if "signals" not in plot:
+                continue
             plot["signals"] = [s for s in plot["signals"] if s not in removed_signals]
             if not plot["signals"]:
                 del self.project_state.plots[i]

@@ -23,9 +23,9 @@ from __future__ import annotations
 from PySide6.QtWidgets import QToolBar, QMessageBox, QProgressDialog, QApplication, QToolButton
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt
+from shiboken6 import isValid
 
 from pySimBlocks.gui.dialogs.display_yaml_dialog import DisplayYamlDialog
-from pySimBlocks.gui.dialogs.plot_dialog import PlotDialog
 from pySimBlocks.gui.dialogs.settings_dialog import SettingsDialog
 from pySimBlocks.gui.project_controller import ProjectController
 from pySimBlocks.gui.services.project_saver import ProjectSaver
@@ -68,6 +68,7 @@ class ToolBarView(QToolBar):
         self.saver = saver
         self.runner = runner
         self.project_controller = project_controller
+        self._plot_dialog = None
 
         save_action = QAction("Save", self)
         save_action.triggered.connect(self.on_save)
@@ -133,6 +134,10 @@ class ToolBarView(QToolBar):
 
     def on_save(self) -> None:
         """Save the project and clear the dirty flag."""
+        window = self.window()
+        if hasattr(window, "save_project"):
+            window.save_project()
+            return
         self.saver.save(self.project_controller.project_state, self.project_controller.view.block_items)
         self.project_controller.clear_dirty()
 
@@ -178,9 +183,22 @@ class ToolBarView(QToolBar):
                 msg,
                 QMessageBox.Ok,
             )
+            return
+
+        dlg = self._plot_dialog
+        if dlg is not None and isValid(dlg):
+            dlg.present()
+
+    def discard_plot_dialog(self) -> None:
+        """Destroy the plot window (e.g. after loading another project)."""
+        dlg = self._plot_dialog
+        self._plot_dialog = None
+        if dlg is not None and isValid(dlg):
+            dlg.close()
+            dlg.deleteLater()
 
     def on_plot_logs(self) -> None:
-        """Open the plot dialog if simulation logs are available."""
+        """Open or restore the plot dialog if simulation logs are available."""
         flag, msg = self.project_controller.project_state.can_plot()
         if not flag:
             QMessageBox.warning(
@@ -190,8 +208,19 @@ class ToolBarView(QToolBar):
                 QMessageBox.Ok,
             )
             return
-        self._plot_dialog = PlotDialog(self.project_controller.project_state, self.parent())  # keep ref because of python garbage collector
-        self._plot_dialog.show()
+
+        dlg = self._plot_dialog
+        if dlg is None or not isValid(dlg):
+            from pySimBlocks.gui.dialogs.plot_dialog import PlotDialog
+
+            dlg = PlotDialog(
+                self.project_controller.project_state,
+                self.project_controller,
+                None,
+            )
+            self._plot_dialog = dlg
+
+        dlg.present()
 
     def set_running(self, running: bool) -> None:
         """Enable or disable all toolbar actions based on the running state.

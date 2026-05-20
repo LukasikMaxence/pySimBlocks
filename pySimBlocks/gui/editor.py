@@ -24,7 +24,6 @@ import sys
 import os
 from pathlib import Path
 from PySide6.QtWidgets import QApplication
-from pySimBlocks.gui.main_window import MainWindow
 
 
 def main() -> None:
@@ -48,7 +47,12 @@ def run_app(project_path: Path) -> None:
         project_path: Resolved path to the project directory to open on
             startup.
     """
-    app = QApplication(sys.argv)
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    # Import after QApplication so matplotlib Qt backends do not touch QFontDatabase early.
+    from pySimBlocks.gui.main_window import MainWindow
+
     window = MainWindow(project_path)
     app.aboutToQuit.connect(window.cleanup)
     window.resize(1100, 600)

@@ -103,7 +103,8 @@ class MainWindow(QMainWindow):
 
         self.save_action = QAction("Save", self)
         self.save_action.setShortcut(QKeySequence.Save)
-        self.save_action.triggered.connect(self._on_save)
+        self.save_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.save_action.triggered.connect(self.save_project)
         self.addAction(self.save_action)
 
         self.quit_action = QAction("Quit", self)
@@ -202,6 +203,7 @@ class MainWindow(QMainWindow):
         Args:
             project_path: Path to the newly loaded project directory.
         """
+        self.toolbar.discard_plot_dialog()
         self.update_window_title()
 
     def cleanup(self) -> None:
@@ -249,12 +251,11 @@ class MainWindow(QMainWindow):
         else:
             return False
 
-    def _on_save(self) -> None:
-        """Save the project if there are unsaved changes."""
-        if not self.project_controller.is_dirty:
-            return
+    def save_project(self) -> None:
+        """Persist the current project to disk and clear the dirty flag."""
         self.saver.save(self.project_controller.project_state, self.project_controller.view.block_items)
         self.undo_manager.set_clean()
+        self.project_controller.clear_dirty()
 
     def _on_clean_changed(self, is_clean: bool) -> None:
         try:
