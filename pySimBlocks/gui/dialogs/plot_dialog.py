@@ -109,6 +109,8 @@ class PlotDialog(QDialog):
 
     def present(self) -> None:
         """Show this window and refresh the preview from the latest logs."""
+        self._populate_signals()
+        self._populate_plot_presets()
         self._update_preview_plot()
         self.show()
         self.raise_()

@@ -183,6 +183,11 @@ class ToolBarView(QToolBar):
                 msg,
                 QMessageBox.Ok,
             )
+            return
+
+        dlg = self._plot_dialog
+        if dlg is not None and isValid(dlg):
+            dlg.present()
 
     def discard_plot_dialog(self) -> None:
         """Destroy the plot window (e.g. after loading another project)."""

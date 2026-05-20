@@ -181,9 +181,18 @@ class ProjectState:
             Tuple containing the availability flag and the reason message.
         """
         if not bool(self.logs):
-            return False, "Simulation has not been done.\nPlease run fist."
+            return False, "Simulation has not been done.\nPlease run first."
 
-        if not ("time" in self.logs):
+        if "time" not in self.logs:
             return False, "Time is not in logs."
+
+        logged_signals = [k for k in self.logs if k != "time"]
+        if not logged_signals:
+            return (
+                False,
+                "No signals were logged.\n"
+                "Open Settings → Simulation, check the output signals to log, "
+                "click OK, then Run again.",
+            )
 
         return True, "Plotting is available."
