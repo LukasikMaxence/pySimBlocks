@@ -362,7 +362,14 @@ class ProjectController(QObject):
         })
         self.make_dirty()
 
-    def update_plot(self, index: int, title: str, signals: list[str], mode: str = "auto") -> None:
+    def update_plot(
+        self,
+        index: int,
+        title: str,
+        signals: list[str],
+        mode: str = "auto",
+        series_styles: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         """Update the title and signals of an existing plot.
 
         Args:
@@ -372,18 +379,26 @@ class ProjectController(QObject):
                 automatically added.
             mode: Plot display mode (``auto``, ``overlay``, ``split_signals``,
                 or ``split_components``).
+            series_styles: Optional per-component style map for YAML storage.
         """
         self._ensure_logged(signals)
         plot = self.project_state.plots[index]
+        styles_unchanged = series_styles is None or plot.get("series_styles") == series_styles
         if (
             plot["signals"] == signals
             and plot["title"] == title
             and str(plot.get("mode", "auto")) == mode
+            and styles_unchanged
         ):
             return
         plot["title"] = title
         plot["signals"] = list(signals)
         plot["mode"] = mode
+        if series_styles is not None:
+            if series_styles:
+                plot["series_styles"] = series_styles
+            else:
+                plot.pop("series_styles", None)
         self.make_dirty()
 
     def delete_plot(self, index: int) -> None:

@@ -18,6 +18,8 @@
 #  Authors: see Authors.txt
 # ******************************************************************************
 
+import copy
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -49,6 +51,8 @@ from pySimBlocks.project.plot_series_helpers import (
     manual_layout_to_plot_dict,
     manual_state_from_layout_plot,
     resolve_series_style,
+    series_style_from_dict,
+    series_style_to_dict,
 )
 
 
@@ -101,6 +105,8 @@ class PlotDialog(QDialog):
         self._manual_active_plot = 0
         self._global_session_styles: dict[str, SeriesStyle] = {}
         self._panel_series_styles: list[dict[str, SeriesStyle]] = [{}]
+        self._mode_preset_working: dict[int, dict[str, object]] = {}
+        self._last_preset_index: int | None = None
 
         self._build_ui()
         self._populate_signals()
@@ -111,22 +117,21 @@ class PlotDialog(QDialog):
 
     def present(self) -> None:
         """Show this window and refresh the preview from the latest logs."""
-        # Snapshot manual state while the signal tree still reflects the UI.
-        if self._uses_manual_layout():
-            self._save_active_manual_selection()
-            self._save_active_manual_title()
+        self._flush_active_preset_working()
         self._populate_signals()
         self._populate_plot_presets()
         if self._uses_manual_layout():
-            # Restore checks/styles from in-memory panels (do not reload preset YAML).
             self._clamp_manual_active_plot()
             self._load_active_manual_title()
             self._load_manual_selection_to_tree(
                 self._manual_plot_selections[self._manual_active_plot]
             )
             self._refresh_all_tree_style_labels()
-        elif self._selected_preset_index() is not None:
-            self._on_plot_preset_changed(self.plot_preset_combo.currentIndex())
+        elif self._is_mode_preset():
+            idx = self._selected_preset_index()
+            if idx is not None:
+                self._load_mode_preset(idx)
+        self._last_preset_index = self._selected_preset_index()
         self._update_preview_plot()
         self.show()
         self.raise_()
@@ -184,11 +189,11 @@ class PlotDialog(QDialog):
 
         self.save_preset_btn = QPushButton("Save plot preset")
         self.save_preset_btn.setToolTip(
-            "Save the current manual layout as a plot preset. "
-            "Overwrites the selected preset or an existing preset with the same name."
+            "Save the current plot preset (manual layout or mode-based). "
+            "Overwrites the selected preset. Use Save project (Ctrl+S) for project.yaml."
         )
         self._disable_enter_key_activation(self.save_preset_btn)
-        self.save_preset_btn.clicked.connect(self._save_manual_as_plot_preset)
+        self.save_preset_btn.clicked.connect(self._save_plot_preset)
         left_layout.addWidget(self.save_preset_btn)
 
         title = QLabel("<b>Signals (logged)</b>")
@@ -207,6 +212,20 @@ class PlotDialog(QDialog):
         self.plot_preset_combo = QComboBox()
         self.plot_preset_combo.currentIndexChanged.connect(self._on_plot_preset_changed)
         left_layout.addWidget(self.plot_preset_combo)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Display mode:"))
+        self.mode_preset_combo = QComboBox()
+        for label, key in [
+            ("Auto (recommended)", "auto"),
+            ("Overlay (single axis)", "overlay"),
+            ("Split by signal", "split_signals"),
+            ("Split by component", "split_components"),
+        ]:
+            self.mode_preset_combo.addItem(label, key)
+        self.mode_preset_combo.currentIndexChanged.connect(self._update_preview_plot)
+        mode_row.addWidget(self.mode_preset_combo, 1)
+        left_layout.addLayout(mode_row)
 
         left_layout.addWidget(QLabel("<b>Subplots filter</b>"))
         subplot_row = QHBoxLayout()
@@ -396,6 +415,10 @@ class PlotDialog(QDialog):
             self._panel_series_styles[pidx][label] = dlg.style()
         else:
             self._global_session_styles[label] = dlg.style()
+            if self._is_mode_preset():
+                idx = self._selected_preset_index()
+                if idx is not None:
+                    self._store_mode_preset_working(idx)
         self._refresh_tree_component_label(label)
         self._update_preview_plot()
 
@@ -426,22 +449,40 @@ class PlotDialog(QDialog):
             self._updating_signal_tree = False
         if self._uses_manual_layout():
             self._save_active_manual_selection()
+        elif self._is_mode_preset():
+            idx = self._selected_preset_index()
+            if idx is not None:
+                self._store_mode_preset_working(idx)
         self._update_preview_plot()
 
     def _on_plot_preset_changed(self, _index: int):
         """Handle plot preset selection changes."""
+        prev_idx = self._last_preset_index
+        if prev_idx is not None and prev_idx != self._selected_preset_index():
+            if 0 <= prev_idx < len(self.project_state.plots):
+                if is_manual_layout_plot(self.project_state.plots[prev_idx]):
+                    self._save_active_manual_selection()
+                    self._save_active_manual_title()
+                else:
+                    self._store_mode_preset_working(prev_idx)
+
         layout_preset = self._is_manual_layout_preset()
         free_manual = self._is_manual_mode()
-        self.signal_tree.setEnabled(free_manual or layout_preset)
-        self.subplot_menu_btn.setEnabled(not free_manual and not layout_preset)
+        mode_preset = self._is_mode_preset()
+        self.signal_tree.setEnabled(free_manual or layout_preset or mode_preset)
         self._sync_manual_controls_enabled()
         self._sync_subplot_all_checkbox()
         if layout_preset:
             idx = self._selected_preset_index()
             if idx is not None:
                 self._load_manual_state_from_layout_plot(self.project_state.plots[idx])
+        elif mode_preset:
+            idx = self._selected_preset_index()
+            if idx is not None:
+                self._load_mode_preset(idx)
         elif free_manual:
             self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
+        self._last_preset_index = self._selected_preset_index()
         self._update_preview_plot()
 
     def _is_manual_mode(self) -> bool:
@@ -459,6 +500,13 @@ class PlotDialog(QDialog):
         """Return True when the preview uses the multi-panel manual layout."""
         return self._is_manual_mode() or self._is_manual_layout_preset()
 
+    def _is_mode_preset(self) -> bool:
+        """Return True when the selected preset uses ``signals`` + ``mode``."""
+        idx = self._selected_preset_index()
+        if idx is None:
+            return False
+        return not is_manual_layout_plot(self.project_state.plots[idx])
+
     def _sync_manual_controls_enabled(self) -> None:
         """Enable manual plot controls for free manual and layout presets."""
         enabled = self._uses_manual_layout()
@@ -466,9 +514,12 @@ class PlotDialog(QDialog):
         self.manual_plot_title_edit.setEnabled(enabled)
         can_remove = enabled and self.manual_plot_count_spin.value() > 1
         self.manual_remove_plot_btn.setEnabled(can_remove)
-        self.save_preset_btn.setEnabled(
-            self._uses_manual_layout() and self.project_controller is not None
+        self.mode_preset_combo.setEnabled(self._is_mode_preset())
+        self.subplot_menu_btn.setEnabled(self._is_mode_preset())
+        can_save = self.project_controller is not None and (
+            self._uses_manual_layout() or self._is_mode_preset()
         )
+        self.save_preset_btn.setEnabled(can_save)
 
     @staticmethod
     def _default_manual_plot_title(index: int) -> str:
@@ -725,7 +776,6 @@ class PlotDialog(QDialog):
             target_idx = 0
         self.plot_preset_combo.setCurrentIndex(target_idx)
         self.plot_preset_combo.blockSignals(False)
-        self.subplot_menu_btn.setEnabled(False)
         self._sync_manual_controls_enabled()
         self._sync_subplot_all_checkbox()
 
@@ -826,7 +876,7 @@ class PlotDialog(QDialog):
             return
 
         preset_plot = self.project_state.plots[preset_index]
-        active_signals = sorted(str(sig) for sig in preset_plot.get("signals", []))
+        active_signals = sorted(self._read_mode_signals_from_tree())
 
         if not active_signals:
             self._refresh_subplot_filter([], keep_current=False)
@@ -869,7 +919,11 @@ class PlotDialog(QDialog):
                 series_by_signal.append((sig, sig_series))
 
             flat_series = flatten_series(series_by_signal)
-            mode = self._resolve_defined_mode(preset_plot, flat_series, series_by_signal)
+            mode = self._resolve_defined_mode(
+                {"mode": self._current_mode_preset_mode()},
+                flat_series,
+                series_by_signal,
+            )
             panels = self._build_panels_for_mode(mode, series_by_signal, flat_series)
             self._refresh_subplot_filter(panels, keep_current=True)
             enabled_panel_keys = self._selected_subplot_keys()
@@ -1141,6 +1195,166 @@ class PlotDialog(QDialog):
         self._clamp_manual_active_plot()
         self._load_active_manual_title()
         self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
+
+    def _flush_active_preset_working(self) -> None:
+        """Persist in-memory edits for the active preset before rebuilding the UI."""
+        idx = self._selected_preset_index()
+        if idx is None:
+            return
+        if is_manual_layout_plot(self.project_state.plots[idx]):
+            self._save_active_manual_selection()
+            self._save_active_manual_title()
+        else:
+            self._store_mode_preset_working(idx)
+
+    def _current_mode_preset_mode(self) -> str:
+        data = self.mode_preset_combo.currentData()
+        if isinstance(data, str):
+            return data
+        return "auto"
+
+    def _set_mode_preset_combo(self, mode: str) -> None:
+        idx = self.mode_preset_combo.findData(mode)
+        if idx < 0:
+            idx = self.mode_preset_combo.findData("auto")
+        if idx < 0:
+            idx = 0
+        self.mode_preset_combo.blockSignals(True)
+        self.mode_preset_combo.setCurrentIndex(idx)
+        self.mode_preset_combo.blockSignals(False)
+
+    def _read_mode_signals_from_tree(self) -> list[str]:
+        """Return top-level signal names checked for a mode-based preset."""
+        selected: list[str] = []
+        for i in range(self.signal_tree.topLevelItemCount()):
+            item = self.signal_tree.topLevelItem(i)
+            data = item.data(0, Qt.UserRole)
+            if not isinstance(data, tuple) or len(data) < 2:
+                continue
+            if data[0] == "signal" and item.checkState(0) == Qt.Checked:
+                selected.append(str(data[1]))
+            elif data[0] == "component" and item.checkState(0) == Qt.Checked:
+                selected.append(str(data[1]))
+        return sorted(set(selected))
+
+    def _load_mode_signals_to_tree(self, signals: set[str]) -> None:
+        """Apply mode-preset signal selection to the signal tree."""
+        self._updating_signal_tree = True
+        try:
+            for i in range(self.signal_tree.topLevelItemCount()):
+                item = self.signal_tree.topLevelItem(i)
+                data = item.data(0, Qt.UserRole)
+                if isinstance(data, tuple) and len(data) == 3 and data[0] == "component":
+                    sig = str(data[1])
+                    checked = sig in signals
+                    item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+                    continue
+                if not isinstance(data, tuple) or len(data) < 2 or data[0] != "signal":
+                    continue
+                sig = str(data[1])
+                checked_count = 0
+                for c in range(item.childCount()):
+                    child = item.child(c)
+                    child_data = child.data(0, Qt.UserRole)
+                    if not isinstance(child_data, tuple) or len(child_data) != 3:
+                        continue
+                    if sig in signals:
+                        child.setCheckState(0, Qt.Checked)
+                        checked_count += 1
+                    else:
+                        child.setCheckState(0, Qt.Unchecked)
+                n_children = item.childCount()
+                if n_children > 0:
+                    if checked_count == n_children and n_children > 0:
+                        item.setCheckState(0, Qt.Checked)
+                    else:
+                        item.setCheckState(0, Qt.Unchecked)
+                else:
+                    item.setCheckState(0, Qt.Checked if sig in signals else Qt.Unchecked)
+        finally:
+            self._updating_signal_tree = False
+
+    def _styles_dict_from_plot(self, plot: dict) -> dict[str, SeriesStyle]:
+        styles: dict[str, SeriesStyle] = {}
+        raw = plot.get("series_styles", {})
+        if isinstance(raw, dict):
+            for lbl, cfg in raw.items():
+                if isinstance(cfg, dict):
+                    styles[str(lbl)] = series_style_from_dict(cfg)
+        return styles
+
+    def _serialize_session_styles(self) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        for lbl, st in self._global_session_styles.items():
+            data = series_style_to_dict(st)
+            if data:
+                out[str(lbl)] = data
+        return out
+
+    def _store_mode_preset_working(self, idx: int) -> None:
+        self._mode_preset_working[idx] = {
+            "signals": self._read_mode_signals_from_tree(),
+            "mode": self._current_mode_preset_mode(),
+            "styles": copy.deepcopy(self._global_session_styles),
+        }
+
+    def _load_mode_preset(self, idx: int) -> None:
+        """Restore a mode preset from session cache or project YAML."""
+        cached = self._mode_preset_working.get(idx)
+        if isinstance(cached, dict):
+            signals = [str(s) for s in cached.get("signals", []) if s]
+            mode = str(cached.get("mode", "auto"))
+            raw_styles = cached.get("styles", {})
+            if isinstance(raw_styles, dict):
+                self._global_session_styles = copy.deepcopy(raw_styles)
+            else:
+                self._global_session_styles = {}
+        else:
+            plot = self.project_state.plots[idx]
+            signals = [str(s) for s in plot.get("signals", []) if s]
+            mode = str(plot.get("mode", "auto"))
+            self._global_session_styles = self._styles_dict_from_plot(plot)
+        self._set_mode_preset_combo(mode)
+        self._load_mode_signals_to_tree(set(signals))
+
+    def _save_plot_preset(self) -> None:
+        """Save the active manual or mode-based plot preset."""
+        if self.project_controller is None:
+            return
+        if self._uses_manual_layout():
+            self._save_manual_as_plot_preset()
+        elif self._is_mode_preset():
+            self._save_mode_as_plot_preset()
+
+    def _save_mode_as_plot_preset(self) -> None:
+        """Write the edited mode-based preset into the project."""
+        idx = self._selected_preset_index()
+        if idx is None or self.project_controller is None:
+            return
+        self._store_mode_preset_working(idx)
+        signals = list(self._mode_preset_working[idx].get("signals", []))
+        if not signals:
+            QMessageBox.warning(
+                self,
+                "Nothing to save",
+                "No signal selected.\nCheck at least one signal.",
+            )
+            return
+        mode = str(self._mode_preset_working[idx].get("mode", "auto"))
+        title = str(self.project_state.plots[idx].get("title", "Plot"))
+        self.project_controller.update_plot(
+            idx,
+            title,
+            signals,
+            mode=mode,
+            series_styles=self._serialize_session_styles(),
+        )
+        QMessageBox.information(
+            self,
+            "Plot preset saved",
+            f"Preset « {title} » updated.\n"
+            "Save the project (Ctrl+S) to write it to project.yaml.",
+        )
 
     def _save_manual_as_plot_preset(self) -> None:
         """Save or overwrite a manual layout plot preset."""
