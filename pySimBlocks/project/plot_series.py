@@ -165,6 +165,49 @@ def flatten_series(
     ]
 
 
+def stack_logged_signal(logs: dict, sig: str) -> np.ndarray:
+    """Stack a logged signal over time into a ``(T, m, n)`` array."""
+    samples = logs.get(sig)
+    if not isinstance(samples, list) or len(samples) == 0:
+        raise ValueError(f"Signal '{sig}' has no samples in logs.")
+    first = None
+    for s in samples:
+        if s is not None:
+            first = np.asarray(s)
+            break
+    if first is None:
+        raise ValueError(f"Signal '{sig}' is always None; cannot plot.")
+    if first.ndim != 2:
+        raise ValueError(f"Signal '{sig}' must be 2D. Got ndim={first.ndim} with shape {first.shape}.")
+    shape0 = first.shape
+    stacked = []
+    for k, s in enumerate(samples):
+        if s is None:
+            raise ValueError(f"Signal '{sig}' contains None at index {k}; cannot plot.")
+        a = np.asarray(s)
+        if a.ndim != 2:
+            raise ValueError(
+                f"Signal '{sig}' sample {k} must be 2D. Got ndim={a.ndim} with shape {a.shape}."
+            )
+        if a.shape != shape0:
+            raise ValueError(
+                f"Signal '{sig}' shape changed over time: expected {shape0}, got {a.shape} at sample {k}."
+            )
+        stacked.append(a)
+    return np.stack(stacked, axis=0)
+
+
+def series_from_signal(logs: dict, sig: str) -> list[tuple[str, np.ndarray]]:
+    """Return flat (label, values) series for one signal."""
+    data = stack_logged_signal(logs, sig)
+    m, n = data.shape[1], data.shape[2]
+    if (m, n) == (1, 1):
+        return [(sig, data[:, 0, 0])]
+    if n == 1:
+        return [(f"{sig}[{i}]", data[:, i, 0]) for i in range(m)]
+    return [(f"{sig}[{r},{c}]", data[:, r, c]) for r in range(m) for c in range(n)]
+
+
 def plot_step_series_styled(
     ax,
     time: np.ndarray,

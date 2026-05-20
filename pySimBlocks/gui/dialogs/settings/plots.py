@@ -26,7 +26,7 @@ from PySide6.QtCore import Qt
 
 from pySimBlocks.gui.models.project_state import ProjectState
 from pySimBlocks.gui.project_controller import ProjectController
-from pySimBlocks.project.plot_series_helpers import is_manual_layout_plot
+from pySimBlocks.project.plot_series import is_manual_layout_plot
 
 
 class PlotSettingsWidget(QWidget):

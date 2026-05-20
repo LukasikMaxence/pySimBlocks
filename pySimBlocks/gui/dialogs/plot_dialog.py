@@ -23,6 +23,7 @@ import copy
 import numpy as np
 import matplotlib.pyplot as plt
 
+from dataclasses import dataclass, field
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout,
     QLabel, QTreeWidget, QTreeWidgetItem,
@@ -40,9 +41,8 @@ from pySimBlocks.gui.models.project_state import ProjectState
 from pySimBlocks.core.config import PlotConfig
 from pySimBlocks.project.plot_from_config import plot_from_config
 from pySimBlocks.gui.dialogs.plot_series_style_dialog import SeriesStyleDialog
-from pySimBlocks.gui.plot_series_draw import plot_step_series
 from pySimBlocks.gui.project_controller import ProjectController
-from pySimBlocks.project.plot_series_helpers import (
+from pySimBlocks.project.plot_series import (
     DEFAULT_SERIES_STYLE,
     SeriesStyle,
     effective_style_for_component,
@@ -50,10 +50,124 @@ from pySimBlocks.project.plot_series_helpers import (
     is_manual_layout_plot,
     manual_layout_to_plot_dict,
     manual_state_from_layout_plot,
+    plot_step_series_styled,
     resolve_series_style,
+    series_from_signal,
     series_style_from_dict,
     series_style_to_dict,
 )
+
+
+@dataclass
+class _ManualLayoutSession:
+    """Holds all mutable state for the multi-panel manual plot editor."""
+
+    selections: list[dict[str, set[str]]] = field(default_factory=lambda: [{}])
+    titles: list[str] = field(default_factory=lambda: ["Plot 1"])
+    active: int = 0
+    panel_styles: list[dict[str, SeriesStyle]] = field(default_factory=lambda: [{}])
+
+    @staticmethod
+    def default_title(index: int) -> str:
+        return f"Plot {index + 1}"
+
+    def ensure_titles_aligned(self) -> None:
+        while len(self.titles) < len(self.selections):
+            self.titles.append(self.default_title(len(self.titles)))
+        if len(self.titles) > len(self.selections):
+            self.titles = self.titles[: len(self.selections)]
+
+    def plot_title(self, index: int) -> str:
+        self.ensure_titles_aligned()
+        if 0 <= index < len(self.titles):
+            text = self.titles[index].strip()
+            if text:
+                return text
+        return self.default_title(index)
+
+    def save_title(self, index: int, text: str) -> None:
+        self.ensure_titles_aligned()
+        idx = min(index, len(self.titles) - 1)
+        self.titles[idx] = text
+
+    def clamp_active(self) -> None:
+        if not self.selections:
+            self.active = 0
+            return
+        self.active = min(self.active, len(self.selections) - 1)
+
+    def resize(self, value: int) -> None:
+        old_count = len(self.selections)
+        if value > old_count:
+            for i in range(old_count, value):
+                self.selections.append({})
+                self.titles.append(self.default_title(i))
+                self.panel_styles.append({})
+        elif value < old_count:
+            self.selections = self.selections[:value]
+            self.titles = self.titles[:value]
+            self.panel_styles = self.panel_styles[:value]
+            if self.active >= value:
+                self.active = max(0, value - 1)
+
+    def remove_at(self, idx: int) -> None:
+        del self.selections[idx]
+        del self.titles[idx]
+        del self.panel_styles[idx]
+        new_count = len(self.selections)
+        if self.active >= new_count:
+            self.active = max(0, new_count - 1)
+
+    def load_from_preset(self, plot: dict) -> None:
+        selections, titles, panel_styles = manual_state_from_layout_plot(plot)
+        if not selections:
+            self.selections = [{}]
+            self.titles = [self.default_title(0)]
+            self.panel_styles = [{}]
+        else:
+            self.selections = selections
+            self.titles = titles
+            self.panel_styles = panel_styles
+            while len(self.panel_styles) < len(self.selections):
+                self.panel_styles.append({})
+            self.panel_styles = self.panel_styles[: len(self.selections)]
+        self.active = 0
+
+
+@dataclass
+class _ModePresetSession:
+    """Holds mutable state for mode-based preset editing (styles + working cache)."""
+
+    styles: dict[str, SeriesStyle] = field(default_factory=dict)
+    working: dict[int, dict] = field(default_factory=dict, init=False, repr=False)
+
+    def store(self, idx: int, signals: list[str], mode: str) -> None:
+        self.working[idx] = {
+            "signals": signals,
+            "mode": mode,
+            "styles": copy.deepcopy(self.styles),
+        }
+
+    def get_cached(self, idx: int) -> dict | None:
+        return self.working.get(idx)
+
+    def serialize_styles(self) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        for lbl, st in self.styles.items():
+            data = series_style_to_dict(st)
+            if data:
+                out[str(lbl)] = data
+        return out
+
+    @staticmethod
+    def styles_from_plot(plot: dict) -> dict[str, SeriesStyle]:
+        styles: dict[str, SeriesStyle] = {}
+        raw = plot.get("series_styles", {})
+        if isinstance(raw, dict):
+            for lbl, cfg in raw.items():
+                if isinstance(cfg, dict):
+                    styles[str(lbl)] = series_style_from_dict(cfg)
+        return styles
 
 
 class PlotDialog(QDialog):
@@ -100,18 +214,14 @@ class PlotDialog(QDialog):
         self._updating_signal_tree = False
         self._focused_panel_key: str | None = None
         self._axis_to_panel_key: dict[int, str] = {}
-        self._manual_plot_selections: list[dict[str, set[str]]] = [{}]
-        self._manual_plot_titles: list[str] = ["Plot 1"]
-        self._manual_active_plot = 0
-        self._global_session_styles: dict[str, SeriesStyle] = {}
-        self._panel_series_styles: list[dict[str, SeriesStyle]] = [{}]
-        self._mode_preset_working: dict[int, dict[str, object]] = {}
+        self._manual = _ManualLayoutSession()
+        self._mode = _ModePresetSession()
         self._last_preset_index: int | None = None
 
         self._build_ui()
         self._populate_signals()
         self._populate_plot_presets()
-        self._clamp_manual_active_plot()
+        self._manual.clamp_active()
         self._load_active_manual_title()
         self._sync_manual_controls_enabled()
 
@@ -121,10 +231,10 @@ class PlotDialog(QDialog):
         self._populate_signals()
         self._populate_plot_presets()
         if self._uses_manual_layout():
-            self._clamp_manual_active_plot()
+            self._manual.clamp_active()
             self._load_active_manual_title()
             self._load_manual_selection_to_tree(
-                self._manual_plot_selections[self._manual_active_plot]
+                self._manual.selections[self._manual.active]
             )
             self._refresh_all_tree_style_labels()
         elif self._is_mode_preset():
@@ -149,8 +259,11 @@ class PlotDialog(QDialog):
     def _build_ui(self):
         """Build the plot dialog user interface."""
         main_layout = QHBoxLayout(self)
+        main_layout.addLayout(self._build_left_panel(), 0)
+        main_layout.addLayout(self._build_right_panel(), 1)
 
-        # ---------- Left panel ----------
+    def _build_left_panel(self) -> QVBoxLayout:
+        """Build and return the left control panel."""
         left_layout = QVBoxLayout()
 
         left_layout.addWidget(QLabel("<b>Manual plots</b>"))
@@ -196,8 +309,7 @@ class PlotDialog(QDialog):
         self.save_preset_btn.clicked.connect(self._save_plot_preset)
         left_layout.addWidget(self.save_preset_btn)
 
-        title = QLabel("<b>Signals (logged)</b>")
-        left_layout.addWidget(title)
+        left_layout.addWidget(QLabel("<b>Signals (logged)</b>"))
 
         self.signal_tree = QTreeWidget()
         self.signal_tree.setColumnCount(2)
@@ -249,9 +361,10 @@ class PlotDialog(QDialog):
         self.plot_defined_btn.clicked.connect(self._plot_defined_plots)
         left_layout.addWidget(self.plot_defined_btn)
 
-        main_layout.addLayout(left_layout, 0)
+        return left_layout
 
-        # ---------- Plot preview ----------
+    def _build_right_panel(self) -> QVBoxLayout:
+        """Build and return the right plot preview panel."""
         self.figure = Figure()
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -277,7 +390,7 @@ class PlotDialog(QDialog):
         right_layout.addLayout(controls_layout)
         right_layout.addWidget(self.nav_toolbar)
         right_layout.addWidget(self.canvas, 1)
-        main_layout.addLayout(right_layout, 1)
+        return right_layout
 
     def _populate_signals(self):
         """Populate the signal list from the available logged signals."""
@@ -321,12 +434,12 @@ class PlotDialog(QDialog):
 
     def _get_series_style(self, label: str, plot: dict | None = None) -> SeriesStyle:
         """Return merged style for a series (session overrides, then plot config)."""
-        return resolve_series_style(label, self._global_session_styles, plot)
+        return resolve_series_style(label, self._mode.styles, plot)
 
     def _get_manual_series_style(self, panel_idx: int, label: str) -> SeriesStyle:
         """Style for one component in a manual-layout panel (per subplot)."""
-        if 0 <= panel_idx < len(self._panel_series_styles):
-            st = self._panel_series_styles[panel_idx].get(label)
+        if 0 <= panel_idx < len(self._manual.panel_styles):
+            st = self._manual.panel_styles[panel_idx].get(label)
             if st is not None:
                 return st
         if self._is_manual_layout_preset():
@@ -339,7 +452,7 @@ class PlotDialog(QDialog):
     def _tree_label_for_component(self, internal_label: str) -> str:
         """Text shown in the signal tree for one component."""
         if self._uses_manual_layout():
-            name = self._get_manual_series_style(self._manual_active_plot, internal_label).display_name.strip()
+            name = self._get_manual_series_style(self._manual.active, internal_label).display_name.strip()
         else:
             plot = None
             idx = self._selected_preset_index()
@@ -395,10 +508,10 @@ class PlotDialog(QDialog):
     def _edit_series_style(self, label: str) -> None:
         """Open the style dialog for one series component."""
         if self._uses_manual_layout():
-            pidx = self._manual_active_plot
-            while len(self._panel_series_styles) <= pidx:
-                self._panel_series_styles.append({})
-            current = self._panel_series_styles[pidx].get(label, SeriesStyle())
+            pidx = self._manual.active
+            while len(self._manual.panel_styles) <= pidx:
+                self._manual.panel_styles.append({})
+            current = self._manual.panel_styles[pidx].get(label, SeriesStyle())
         else:
             plot = None
             idx = self._selected_preset_index()
@@ -411,10 +524,10 @@ class PlotDialog(QDialog):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if self._uses_manual_layout():
-            pidx = self._manual_active_plot
-            self._panel_series_styles[pidx][label] = dlg.style()
+            pidx = self._manual.active
+            self._manual.panel_styles[pidx][label] = dlg.style()
         else:
-            self._global_session_styles[label] = dlg.style()
+            self._mode.styles[label] = dlg.style()
             if self._is_mode_preset():
                 idx = self._selected_preset_index()
                 if idx is not None:
@@ -481,7 +594,7 @@ class PlotDialog(QDialog):
             if idx is not None:
                 self._load_mode_preset(idx)
         elif free_manual:
-            self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
+            self._load_manual_selection_to_tree(self._manual.selections[self._manual.active])
         self._last_preset_index = self._selected_preset_index()
         self._update_preview_plot()
 
@@ -521,44 +634,21 @@ class PlotDialog(QDialog):
         )
         self.save_preset_btn.setEnabled(can_save)
 
-    @staticmethod
-    def _default_manual_plot_title(index: int) -> str:
-        return f"Plot {index + 1}"
-
-    def _ensure_manual_titles(self) -> None:
-        """Keep title list aligned with manual plot count."""
-        while len(self._manual_plot_titles) < len(self._manual_plot_selections):
-            i = len(self._manual_plot_titles)
-            self._manual_plot_titles.append(self._default_manual_plot_title(i))
-        if len(self._manual_plot_titles) > len(self._manual_plot_selections):
-            self._manual_plot_titles = self._manual_plot_titles[: len(self._manual_plot_selections)]
-
-    def _manual_plot_title(self, index: int) -> str:
-        """Return the axis title for one manual plot panel."""
-        self._ensure_manual_titles()
-        if 0 <= index < len(self._manual_plot_titles):
-            text = self._manual_plot_titles[index].strip()
-            if text:
-                return text
-        return self._default_manual_plot_title(index)
-
     def _save_active_manual_title(self) -> None:
         """Persist the title field into the active manual plot."""
-        if not self._manual_plot_selections:
+        if not self._manual.selections:
             return
-        self._ensure_manual_titles()
-        idx = min(self._manual_active_plot, len(self._manual_plot_titles) - 1)
-        self._manual_plot_titles[idx] = self.manual_plot_title_edit.text().strip()
+        self._manual.save_title(self._manual.active, self.manual_plot_title_edit.text().strip())
 
     def _load_active_manual_title(self) -> None:
         """Load the active manual plot title into the title field."""
-        if not self._manual_plot_selections:
+        if not self._manual.selections:
             self.manual_plot_title_edit.clear()
             return
-        self._ensure_manual_titles()
-        idx = min(self._manual_active_plot, len(self._manual_plot_titles) - 1)
+        self._manual.ensure_titles_aligned()
+        idx = min(self._manual.active, len(self._manual.titles) - 1)
         self.manual_plot_title_edit.blockSignals(True)
-        self.manual_plot_title_edit.setText(self._manual_plot_titles[idx])
+        self.manual_plot_title_edit.setText(self._manual.titles[idx])
         self.manual_plot_title_edit.blockSignals(False)
 
     def _on_manual_plot_title_edited(self) -> None:
@@ -566,81 +656,56 @@ class PlotDialog(QDialog):
         self._save_active_manual_title()
         self._update_preview_plot()
 
-    def _clamp_manual_active_plot(self) -> None:
-        """Keep the active manual plot index within range."""
-        if not self._manual_plot_selections:
-            self._manual_active_plot = 0
-            return
-        self._manual_active_plot = min(
-            self._manual_active_plot, len(self._manual_plot_selections) - 1
-        )
-
     def _on_manual_plot_count_changed(self, value: int) -> None:
         """Grow or shrink manual plots; decreasing removes only the last plot."""
         self._save_active_manual_selection()
         self._save_active_manual_title()
-        old_count = len(self._manual_plot_selections)
-        if value > old_count:
-            for i in range(old_count, value):
-                self._manual_plot_selections.append({})
-                self._manual_plot_titles.append(self._default_manual_plot_title(i))
-                self._panel_series_styles.append({})
-        elif value < old_count:
-            self._manual_plot_selections = self._manual_plot_selections[:value]
-            self._manual_plot_titles = self._manual_plot_titles[:value]
-            self._panel_series_styles = self._panel_series_styles[:value]
-            if self._manual_active_plot >= value:
-                self._manual_active_plot = max(0, value - 1)
-        self._clamp_manual_active_plot()
+        self._manual.resize(value)
+        self._manual.clamp_active()
         self._sync_manual_controls_enabled()
         self._load_active_manual_title()
-        self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
+        self._load_manual_selection_to_tree(self._manual.selections[self._manual.active])
         self._refresh_all_tree_style_labels()
         self._update_preview_plot()
 
     def _on_manual_remove_selected_plot(self) -> None:
         """Remove the plot currently selected for editing."""
-        if len(self._manual_plot_selections) <= 1:
+        if len(self._manual.selections) <= 1:
             return
         self._save_active_manual_title()
-        idx = self._manual_active_plot
-        del self._manual_plot_selections[idx]
-        del self._manual_plot_titles[idx]
-        del self._panel_series_styles[idx]
-        new_count = len(self._manual_plot_selections)
+        self._manual.remove_at(self._manual.active)
+        new_count = len(self._manual.selections)
         self.manual_plot_count_spin.blockSignals(True)
         self.manual_plot_count_spin.setValue(new_count)
         self.manual_plot_count_spin.blockSignals(False)
-        if self._manual_active_plot >= new_count:
-            self._manual_active_plot = new_count - 1
-        self._clamp_manual_active_plot()
+        self._manual.clamp_active()
         self._sync_manual_controls_enabled()
         self._load_active_manual_title()
-        self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
+        self._load_manual_selection_to_tree(self._manual.selections[self._manual.active])
         self._refresh_all_tree_style_labels()
         self._update_preview_plot()
 
     def _select_manual_plot(self, index: int) -> None:
         """Select a manual plot for editing (e.g. after clicking its axis)."""
-        if index < 0 or index >= len(self._manual_plot_selections):
+        if index < 0 or index >= len(self._manual.selections):
             return
-        if index == self._manual_active_plot:
+        if index == self._manual.active:
             self._update_preview_plot()
             return
         self._save_active_manual_selection()
         self._save_active_manual_title()
-        self._manual_active_plot = index
+        self._manual.active = index
         self._load_active_manual_title()
-        self._load_manual_selection_to_tree(self._manual_plot_selections[index])
+        self._load_manual_selection_to_tree(self._manual.selections[index])
         self._update_preview_plot()
 
     def _save_active_manual_selection(self) -> None:
         """Persist the signal tree checks into the active manual plot."""
-        if not self._manual_plot_selections:
+        if not self._manual.selections:
             return
-        idx = min(self._manual_active_plot, len(self._manual_plot_selections) - 1)
-        self._manual_active_plot = idx
-        self._manual_plot_selections[idx] = self._read_selection_from_signal_tree()
+        idx = min(self._manual.active, len(self._manual.selections) - 1)
+        self._manual.active = idx
+        self._manual.selections[idx] = self._read_selection_from_signal_tree()
 
     def _read_selection_from_signal_tree(self) -> dict[str, set[str]]:
         """Return selected component labels per signal from the tree widget."""
@@ -798,63 +863,7 @@ class PlotDialog(QDialog):
 
     def _component_labels_for_signal(self, sig: str) -> list[str]:
         """Return component labels for one signal."""
-        data = self._stack_logged_signal_2d(sig)
-        m, n = data.shape[1], data.shape[2]
-        if (m, n) == (1, 1):
-            return [sig]
-        if n == 1:
-            return [f"{sig}[{i}]" for i in range(m)]
-        return [f"{sig}[{r},{c}]" for r in range(m) for c in range(n)]
-
-    def _stack_logged_signal_2d(self, sig: str) -> np.ndarray:
-        """Stack a logged signal over time while preserving its 2D shape.
-
-        Args:
-            sig: Signal name to stack from the logs.
-
-        Returns:
-            Array of shape ``(T, m, n)`` containing the stacked samples.
-
-        Raises:
-            ValueError: If the signal is missing, contains ``None``, or its
-                samples are not consistent 2D arrays.
-        """
-        samples = self.project_state.logs.get(sig, None)
-        if not isinstance(samples, list) or len(samples) == 0:
-            raise ValueError(f"Signal '{sig}' has no samples in logs.")
-
-        # Find first non-None sample to define shape
-        first = None
-        for s in samples:
-            if s is not None:
-                first = np.asarray(s)
-                break
-
-        if first is None:
-            raise ValueError(f"Signal '{sig}' is always None; cannot plot.")
-
-        if first.ndim != 2:
-            raise ValueError(f"Signal '{sig}' must be 2D. Got ndim={first.ndim} with shape {first.shape}.")
-
-        shape0 = first.shape
-
-        stacked = []
-        for k, s in enumerate(samples):
-            if s is None:
-                raise ValueError(f"Signal '{sig}' contains None at index {k}; cannot plot.")
-            a = np.asarray(s)
-            if a.ndim != 2:
-                raise ValueError(
-                    f"Signal '{sig}' sample {k} must be 2D. Got ndim={a.ndim} with shape {a.shape}."
-                )
-            if a.shape != shape0:
-                raise ValueError(
-                    f"Signal '{sig}' shape changed over time: expected {shape0}, got {a.shape} at sample {k}."
-                )
-            stacked.append(a)
-
-        return np.stack(stacked, axis=0)  # (T, m, n)
-
+        return [label for label, _ in series_from_signal(self.project_state.logs, sig)]
 
     def _update_preview_plot(self):
         """Redraw the embedded preview plot from the selected signals."""
@@ -865,9 +874,9 @@ class PlotDialog(QDialog):
                 sel = self._read_selection_from_signal_tree()
                 # Avoid wiping panel data when the tree was rebuilt but not restored yet.
                 if sel or not (
-                    self._manual_plot_selections
-                    and self._manual_plot_selections[
-                        min(self._manual_active_plot, len(self._manual_plot_selections) - 1)
+                    self._manual.selections
+                    and self._manual.selections[
+                        min(self._manual.active, len(self._manual.selections) - 1)
                     ]
                 ):
                     self._save_active_manual_selection()
@@ -889,33 +898,12 @@ class PlotDialog(QDialog):
         try:
             series_by_signal: list[tuple[str, list[tuple[str, np.ndarray]]]] = []
             for sig in active_signals:
-                data = self._stack_logged_signal_2d(sig)  # (T, m, n)
-
-                if data.shape[0] != T:
+                sig_series = series_from_signal(self.project_state.logs, sig)
+                n_samples = len(sig_series[0][1]) if sig_series else 0
+                if n_samples != T:
                     raise ValueError(
-                        f"Time length mismatch for '{sig}': time has {T} samples but signal has {data.shape[0]}."
+                        f"Time length mismatch for '{sig}': time has {T} samples but signal has {n_samples}."
                     )
-
-                m, n = data.shape[1], data.shape[2]
-
-                # scalar
-                if (m, n) == (1, 1):
-                    series_by_signal.append((sig, [(sig, data[:, 0, 0])]))
-                    continue
-
-                # vector column (m,1)
-                if n == 1:
-                    sig_series = []
-                    for i in range(m):
-                        sig_series.append((f"{sig}[{i}]", data[:, i, 0]))
-                    series_by_signal.append((sig, sig_series))
-                    continue
-
-                # matrix (m,n)
-                sig_series = []
-                for r in range(m):
-                    for c in range(n):
-                        sig_series.append((f"{sig}[{r},{c}]", data[:, r, c]))
                 series_by_signal.append((sig, sig_series))
 
             flat_series = flatten_series(series_by_signal)
@@ -953,22 +941,14 @@ class PlotDialog(QDialog):
         T = len(time)
         series: list[tuple[str, np.ndarray]] = []
         for sig in sorted(selection.keys()):
-            data = self._stack_logged_signal_2d(sig)
-            if data.shape[0] != T:
+            sig_series = series_from_signal(self.project_state.logs, sig)
+            n_samples = len(sig_series[0][1]) if sig_series else 0
+            if n_samples != T:
                 raise ValueError(
-                    f"Time length mismatch for '{sig}': time has {T} samples but signal has {data.shape[0]}."
+                    f"Time length mismatch for '{sig}': time has {T} samples but signal has {n_samples}."
                 )
-            m, n = data.shape[1], data.shape[2]
-            if (m, n) == (1, 1):
-                candidates = [(sig, data[:, 0, 0])]
-            elif n == 1:
-                candidates = [(f"{sig}[{i}]", data[:, i, 0]) for i in range(m)]
-            else:
-                candidates = [
-                    (f"{sig}[{r},{c}]", data[:, r, c]) for r in range(m) for c in range(n)
-                ]
             selected_labels = selection[sig]
-            for label, values in candidates:
+            for label, values in sig_series:
                 if label in selected_labels:
                     series.append((label, values))
         return series
@@ -985,7 +965,7 @@ class PlotDialog(QDialog):
         """Draw one manual plot panel and register it for hit-testing."""
         if series:
             for label, values in series:
-                plot_step_series(
+                plot_step_series_styled(
                     ax,
                     time,
                     values,
@@ -1004,23 +984,23 @@ class PlotDialog(QDialog):
         ax.set_title(title)
         self._style_axis(ax)
         self._axis_to_panel_key[id(ax)] = key
-        self._highlight_manual_axis(ax, key == f"manual::{self._manual_active_plot}")
+        self._highlight_manual_axis(ax, key == f"manual::{self._manual.active}")
 
     def _render_manual_plots_preview(self) -> None:
         """Render all manual plot panels in a 2-column grid (last odd spans full width)."""
         self._refresh_subplot_filter([], keep_current=False)
         self._axis_to_panel_key.clear()
 
-        n_plots = len(self._manual_plot_selections)
+        n_plots = len(self._manual.selections)
         if n_plots == 0:
             return
 
         time = np.asarray(self.project_state.logs["time"]).flatten()
         panels: list[tuple[str, str, list[tuple[str, np.ndarray]]]] = []
         try:
-            for i, selection in enumerate(self._manual_plot_selections):
+            for i, selection in enumerate(self._manual.selections):
                 series = self._series_from_manual_selection(selection, time)
-                title = self._manual_plot_title(i)
+                title = self._manual.plot_title(i)
                 panels.append((title, f"manual::{i}", series))
         except Exception as e:
             ax = self.figure.add_subplot(111)
@@ -1176,25 +1156,13 @@ class PlotDialog(QDialog):
 
     def _load_manual_state_from_layout_plot(self, plot: dict) -> None:
         """Restore manual panels, titles, and styles from a layout preset."""
-        selections, titles, panel_styles = manual_state_from_layout_plot(plot)
-        if not selections:
-            self._manual_plot_selections = [{}]
-            self._manual_plot_titles = [self._default_manual_plot_title(0)]
-            self._panel_series_styles = [{}]
-        else:
-            self._manual_plot_selections = selections
-            self._manual_plot_titles = titles
-            self._panel_series_styles = panel_styles
-            while len(self._panel_series_styles) < len(self._manual_plot_selections):
-                self._panel_series_styles.append({})
-            self._panel_series_styles = self._panel_series_styles[: len(self._manual_plot_selections)]
-        self._manual_active_plot = 0
+        self._manual.load_from_preset(plot)
         self.manual_plot_count_spin.blockSignals(True)
-        self.manual_plot_count_spin.setValue(len(self._manual_plot_selections))
+        self.manual_plot_count_spin.setValue(len(self._manual.selections))
         self.manual_plot_count_spin.blockSignals(False)
-        self._clamp_manual_active_plot()
+        self._manual.clamp_active()
         self._load_active_manual_title()
-        self._load_manual_selection_to_tree(self._manual_plot_selections[self._manual_active_plot])
+        self._load_manual_selection_to_tree(self._manual.selections[self._manual.active])
 
     def _flush_active_preset_working(self) -> None:
         """Persist in-memory edits for the active preset before rebuilding the UI."""
@@ -1274,46 +1242,22 @@ class PlotDialog(QDialog):
         finally:
             self._updating_signal_tree = False
 
-    def _styles_dict_from_plot(self, plot: dict) -> dict[str, SeriesStyle]:
-        styles: dict[str, SeriesStyle] = {}
-        raw = plot.get("series_styles", {})
-        if isinstance(raw, dict):
-            for lbl, cfg in raw.items():
-                if isinstance(cfg, dict):
-                    styles[str(lbl)] = series_style_from_dict(cfg)
-        return styles
-
-    def _serialize_session_styles(self) -> dict[str, dict[str, str]]:
-        out: dict[str, dict[str, str]] = {}
-        for lbl, st in self._global_session_styles.items():
-            data = series_style_to_dict(st)
-            if data:
-                out[str(lbl)] = data
-        return out
-
     def _store_mode_preset_working(self, idx: int) -> None:
-        self._mode_preset_working[idx] = {
-            "signals": self._read_mode_signals_from_tree(),
-            "mode": self._current_mode_preset_mode(),
-            "styles": copy.deepcopy(self._global_session_styles),
-        }
+        self._mode.store(idx, self._read_mode_signals_from_tree(), self._current_mode_preset_mode())
 
     def _load_mode_preset(self, idx: int) -> None:
         """Restore a mode preset from session cache or project YAML."""
-        cached = self._mode_preset_working.get(idx)
+        cached = self._mode.get_cached(idx)
         if isinstance(cached, dict):
             signals = [str(s) for s in cached.get("signals", []) if s]
             mode = str(cached.get("mode", "auto"))
             raw_styles = cached.get("styles", {})
-            if isinstance(raw_styles, dict):
-                self._global_session_styles = copy.deepcopy(raw_styles)
-            else:
-                self._global_session_styles = {}
+            self._mode.styles = copy.deepcopy(raw_styles) if isinstance(raw_styles, dict) else {}
         else:
             plot = self.project_state.plots[idx]
             signals = [str(s) for s in plot.get("signals", []) if s]
             mode = str(plot.get("mode", "auto"))
-            self._global_session_styles = self._styles_dict_from_plot(plot)
+            self._mode.styles = _ModePresetSession.styles_from_plot(plot)
         self._set_mode_preset_combo(mode)
         self._load_mode_signals_to_tree(set(signals))
 
@@ -1332,7 +1276,8 @@ class PlotDialog(QDialog):
         if idx is None or self.project_controller is None:
             return
         self._store_mode_preset_working(idx)
-        signals = list(self._mode_preset_working[idx].get("signals", []))
+        cached = self._mode.get_cached(idx) or {}
+        signals = list(cached.get("signals", []))
         if not signals:
             QMessageBox.warning(
                 self,
@@ -1340,14 +1285,14 @@ class PlotDialog(QDialog):
                 "No signal selected.\nCheck at least one signal.",
             )
             return
-        mode = str(self._mode_preset_working[idx].get("mode", "auto"))
+        mode = str(cached.get("mode", "auto"))
         title = str(self.project_state.plots[idx].get("title", "Plot"))
         self.project_controller.update_plot(
             idx,
             title,
             signals,
             mode=mode,
-            series_styles=self._serialize_session_styles(),
+            series_styles=self._mode.serialize_styles(),
         )
         QMessageBox.information(
             self,
@@ -1363,7 +1308,7 @@ class PlotDialog(QDialog):
 
         self._save_active_manual_selection()
         self._save_active_manual_title()
-        self._ensure_manual_titles()
+        self._manual.ensure_titles_aligned()
 
         editing_idx = (
             self._selected_preset_index() if self._is_manual_layout_preset() else None
@@ -1374,7 +1319,7 @@ class PlotDialog(QDialog):
             ).strip() or "Manual layout"
         else:
             default_name = (
-                self._manual_plot_title(0) if self._manual_plot_titles else "Manual layout"
+                self._manual.plot_title(0) if self._manual.titles else "Manual layout"
             )
             name, ok = QInputDialog.getText(
                 self,
@@ -1387,9 +1332,9 @@ class PlotDialog(QDialog):
             preset_name = name.strip()
         plot_dict = manual_layout_to_plot_dict(
             preset_name,
-            self._manual_plot_titles,
-            self._manual_plot_selections,
-            self._panel_series_styles,
+            self._manual.titles,
+            self._manual.selections,
+            self._manual.panel_styles,
         )
         if plot_dict is None:
             QMessageBox.warning(
@@ -1459,7 +1404,7 @@ class PlotDialog(QDialog):
             ax = self.figure.add_subplot(111)
             title, key, series = panels[0]
             for label, values in series:
-                plot_step_series(ax, time, values, label, self._get_series_style(label, plot))
+                plot_step_series_styled(ax, time, values, label, self._get_series_style(label, plot))
             ax.set_title(title)
             self._style_axis(ax)
             self._axis_to_panel_key[id(ax)] = key
@@ -1472,7 +1417,7 @@ class PlotDialog(QDialog):
         for i, (title, key, series) in enumerate(panels):
             ax = axes[i]
             for label, values in series:
-                plot_step_series(ax, time, values, label, self._get_series_style(label, plot))
+                plot_step_series_styled(ax, time, values, label, self._get_series_style(label, plot))
             ax.set_title(title)
             self._style_axis(ax)
             self._axis_to_panel_key[id(ax)] = key
@@ -1487,7 +1432,6 @@ class PlotDialog(QDialog):
         ax.grid(self.grid_cb.isChecked())
         if self.legend_cb.isChecked() and ax.lines:
             ax.legend()
-
 
     def _finalize_layout(self) -> None:
         """Apply a robust layout for many stacked axes."""
