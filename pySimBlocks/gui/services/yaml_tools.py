@@ -278,6 +278,11 @@ def _build_layout_section(
     return data
 
 
+def _build_groups_section(project_state: ProjectState) -> list[dict]:
+    """Build serialized visual groups for the GUI section."""
+    return [group.to_dict() for group in project_state.visual_groups]
+
+
 def build_project_yaml(
     project_state: ProjectState,
     block_items: dict[str, BlockItem] | None = None,
@@ -301,6 +306,7 @@ def build_project_yaml(
     blocks = _build_blocks_section(project_state)
     connections, conn_name_map = _build_connections_section(project_state)
     layout = _build_layout_section(block_items, conn_name_map)
+    groups = _build_groups_section(project_state)
 
     return {
         "schema_version": 1,
@@ -314,5 +320,6 @@ def build_project_yaml(
         },
         "gui": {
             "layout": layout,
+            "groups": groups,
         },
     }

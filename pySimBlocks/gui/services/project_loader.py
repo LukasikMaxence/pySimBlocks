@@ -23,7 +23,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPointF
 
-from pySimBlocks.gui.models import BlockInstance
+from pySimBlocks.gui.models import BlockInstance, VisualGroup
 from pySimBlocks.gui.project_controller import ProjectController
 from pySimBlocks.gui.services.yaml_tools import load_yaml_file
 from pySimBlocks.gui.undo_redo.commands import ConnectionSnapshot
@@ -87,6 +87,7 @@ class ProjectLoaderYaml(ProjectLoader):
         self._load_connections(controller, diagram_data, layout_conns)
         self._load_logging(controller, sim_data)
         self._load_plots(controller, sim_data)
+        self._load_groups(controller, gui_data)
 
         controller.clear_dirty()
 
@@ -252,6 +253,30 @@ class ProjectLoaderYaml(ProjectLoader):
         """Load the configured plot definitions."""
         plot_data = sim_data.get("plots", [])
         controller.project_state.plots = plot_data if isinstance(plot_data, list) else []
+
+    def _load_groups(self, controller: ProjectController, gui_data: dict) -> None:
+        """Load visual groups from GUI-only project data."""
+        if not isinstance(gui_data, dict):
+            controller.project_state.visual_groups = []
+            return
+
+        groups_data = gui_data.get("groups", [])
+        if not isinstance(groups_data, list):
+            print("[Groups warning] project.yaml gui.groups is invalid, ignored.")
+            controller.project_state.visual_groups = []
+            return
+
+        groups: list[VisualGroup] = []
+        for idx, raw in enumerate(groups_data):
+            if not isinstance(raw, dict):
+                print(f"[Groups warning] Invalid group entry at index {idx}, ignored.")
+                continue
+            group = VisualGroup.from_dict(raw)
+            if not group.uid:
+                print(f"[Groups warning] Group at index {idx} has empty uid, ignored.")
+                continue
+            groups.append(group)
+        controller.project_state.visual_groups = groups
 
     def _load_layout_data(self, gui_data: dict) -> tuple[dict, dict, list[str]]:
         """Extract block and connection layout data from GUI configuration."""

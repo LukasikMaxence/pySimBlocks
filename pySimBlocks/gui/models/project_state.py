@@ -23,6 +23,7 @@ from pathlib import Path
 from pySimBlocks.gui.models.block_instance import BlockInstance, PortInstance
 from pySimBlocks.gui.models.connection_instance import ConnectionInstance
 from pySimBlocks.gui.models.project_simulation_params import ProjectSimulationParams
+from pySimBlocks.gui.models.visual_group import VisualGroup
 
 class ProjectState:
     """Store the editable state of a GUI project.
@@ -55,6 +56,7 @@ class ProjectState:
         self.logging: list[str] = []
         self.logs: dict = {}
         self.plots: list[dict[str, str | list[str]]] = []
+        self.visual_groups: list[VisualGroup] = []
 
 
     # --- Public methods ---
@@ -67,6 +69,7 @@ class ProjectState:
         self.logs.clear()
         self.logging.clear()
         self.plots.clear()
+        self.visual_groups.clear()
 
         self.simulation.clear()
 
