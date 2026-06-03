@@ -21,15 +21,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import uuid
 from typing import TYPE_CHECKING, Any, Callable
 
 from PySide6.QtCore import QObject, Signal, QPointF, QRectF
 
 from pySimBlocks.gui.models import (
     BlockInstance,
+    BoundaryPort,
     ConnectionInstance,
     PortInstance,
     ProjectState,
+    VisualGroup,
 )
 from pySimBlocks.gui.widgets.diagram_view import DiagramView
 from pySimBlocks.gui.blocks.block_meta import BlockMeta
@@ -180,6 +183,41 @@ class ProjectController(QObject):
             block_instance: The block to remove.
         """
         self.undo_manager.push(RemoveBlockCommand(self, block_instance))
+
+    def group_blocks(self, blocks: list[BlockInstance], name: str | None = None) -> VisualGroup:
+        """Create a visual group from an explicit block selection."""
+        unique_blocks: list[BlockInstance] = []
+        seen = set()
+        for block in blocks:
+            if block.uid in seen:
+                continue
+            seen.add(block.uid)
+            unique_blocks.append(block)
+
+        if len(unique_blocks) < 2:
+            raise ValueError("At least two blocks are required to create a group.")
+
+        member_uids = [b.uid for b in unique_blocks]
+        default_name = self._make_unique_group_name(name or "Group")
+        group = VisualGroup(
+            uid=uuid.uuid4().hex,
+            name=default_name,
+            members=member_uids,
+            parent_uid=None,
+            layout={},
+            boundary_ports=self._build_group_boundary_ports(member_uids),
+            child_group_uids=[],
+        )
+        self.project_state.visual_groups.append(group)
+        self.make_dirty()
+        return group
+
+    def ungroup(self, group_uid: str) -> bool:
+        """Remove a visual group by UID."""
+        removed = self.project_state.remove_visual_group(group_uid)
+        if removed:
+            self.make_dirty()
+        return removed
 
     def make_unique_name(self, base_name: str) -> str:
         """Return ``base_name`` or a suffixed variant that is unique across all blocks.
@@ -675,3 +713,48 @@ class ProjectController(QObject):
             self.view.refresh_block_port(block_instance)
             return removed
         return []
+
+    def _build_group_boundary_ports(self, member_uids: list[str]) -> list[BoundaryPort]:
+        """Derive boundary ports from connections crossing group boundaries."""
+        members = set(member_uids)
+        boundary_ports: list[BoundaryPort] = []
+        by_internal_port_uid: dict[tuple[str, str], BoundaryPort] = {}
+
+        for connection in self.project_state.connections:
+            src_in = connection.src_block().uid in members
+            dst_in = connection.dst_block().uid in members
+            if src_in == dst_in:
+                continue
+
+            if dst_in:
+                direction = "input"
+                internal_port = connection.dst_port
+            else:
+                direction = "output"
+                internal_port = connection.src_port
+
+            key = (internal_port.block.uid, internal_port.name)
+            if key in by_internal_port_uid:
+                continue
+
+            boundary = BoundaryPort(
+                uid=uuid.uuid4().hex,
+                direction=direction,
+                linked_port_uid=f"{internal_port.block.uid}:{internal_port.name}",
+                origin="auto",
+                linked_connection_uid=f"{connection.src_block().uid}:{connection.src_port.name}->{connection.dst_block().uid}:{connection.dst_port.name}",
+            )
+            by_internal_port_uid[key] = boundary
+            boundary_ports.append(boundary)
+
+        return boundary_ports
+
+    def _make_unique_group_name(self, base_name: str) -> str:
+        """Return a unique visual group name based on existing groups."""
+        existing = {g.name for g in self.project_state.visual_groups}
+        if base_name not in existing:
+            return base_name
+        i = 1
+        while f"{base_name}_{i}" in existing:
+            i += 1
+        return f"{base_name}_{i}"
