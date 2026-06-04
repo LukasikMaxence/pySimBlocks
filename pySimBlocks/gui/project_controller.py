@@ -44,6 +44,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     EditBlockParamsCommand,
     GroupBlocksCommand,
     MoveResizeBlockCommand,
+    MoveResizeGroupCommand,
     RemoveBlockCommand,
     RemoveConnectionCommand,
     ToggleOrientationCommand,
@@ -317,6 +318,20 @@ class ProjectController(QObject):
         self.undo_manager.push(
             MoveResizeBlockCommand(
                 self, block_instance.uid, old_pos, old_rect, new_pos, new_rect
+            )
+        )
+
+    def execute_move_resize_group(
+        self,
+        group_uid: str,
+        old_pos: QPointF,
+        old_rect: QRectF,
+        new_pos: QPointF,
+        new_rect: QRectF,
+    ) -> None:
+        self.undo_manager.push(
+            MoveResizeGroupCommand(
+                self, group_uid, old_pos, old_rect, new_pos, new_rect
             )
         )
 
@@ -671,6 +686,24 @@ class ProjectController(QObject):
         self.project_state.add_connection(connection_instance)
         self.view.add_connection(connection_instance, snapshot.points)
         return connection_instance
+
+    def _set_group_geometry(self, group_uid: str, pos: QPointF, rect: QRectF) -> None:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        group.layout = {
+            "x": float(pos.x()),
+            "y": float(pos.y()),
+            "width": float(rect.width()),
+            "height": float(rect.height()),
+        }
+        group_item = self.view.group_items.get(group_uid)
+        if group_item is None:
+            return
+        group_item.setPos(QPointF(pos))
+        group_item.setRect(0, 0, rect.width(), rect.height())
+        group_item.sync_boundary_ports()
+        self.view.on_group_moved(group_item)
 
     def _set_block_geometry(self, block_uid: str, pos: QPointF, rect: QRectF) -> None:
         block = self._find_block_by_uid(block_uid)

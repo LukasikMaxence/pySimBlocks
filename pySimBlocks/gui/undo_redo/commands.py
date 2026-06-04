@@ -202,6 +202,33 @@ class UngroupCommand(QUndoCommand):
             self._controller.make_dirty()
 
 
+class MoveResizeGroupCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        group_uid: str,
+        old_pos: QPointF,
+        old_rect: QRectF,
+        new_pos: QPointF,
+        new_rect: QRectF,
+    ):
+        super().__init__("Move/Resize Group")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._old_pos = QPointF(old_pos)
+        self._old_rect = QRectF(old_rect)
+        self._new_pos = QPointF(new_pos)
+        self._new_rect = QRectF(new_rect)
+
+    def redo(self) -> None:
+        self._controller._set_group_geometry(self._group_uid, self._new_pos, self._new_rect)
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._set_group_geometry(self._group_uid, self._old_pos, self._old_rect)
+        self._controller.make_dirty()
+
+
 class EditBlockParamsCommand(QUndoCommand):
     def __init__(self, controller, block_instance: BlockInstance, new_params: dict[str, Any]):
         super().__init__("Edit Block Parameters")
