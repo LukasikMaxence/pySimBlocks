@@ -122,8 +122,9 @@ class ConnectionItem(QGraphicsPathItem):
         if self.is_temporary:
             return
 
-        p1 = self.src_port.connection_anchor()
-        p2 = self.dst_port.connection_anchor()
+        view = self.src_port.parent_block.view
+        p1 = view.connection_anchor_for_port_item(self.src_port)
+        p2 = view.connection_anchor_for_port_item(self.dst_port)
         if self.is_manual and self.route and len(self.route.points) >= 2:
             self.route.points[0] = p1
             self.route.points[-1] = p2

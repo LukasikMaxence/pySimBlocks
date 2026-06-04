@@ -26,7 +26,7 @@ from typing import Any
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QUndoCommand
 
-from pySimBlocks.gui.models import BlockInstance, PortInstance
+from pySimBlocks.gui.models import BlockInstance, PortInstance, VisualGroup
 
 
 @dataclass
@@ -154,6 +154,52 @@ class ToggleOrientationCommand(QUndoCommand):
     def undo(self) -> None:
         self._controller._set_block_orientation(self._block_uid, self._old_orientation)
         self._controller.make_dirty()
+
+
+class GroupBlocksCommand(QUndoCommand):
+    def __init__(self, controller, blocks: list[BlockInstance], name: str | None = None):
+        super().__init__("Group Blocks")
+        self._controller = controller
+        self._blocks = list(blocks)
+        self._name = name
+        self._group_uid: str | None = None
+
+    def redo(self) -> None:
+        group = self._controller._create_visual_group(self._blocks, self._name)
+        self._group_uid = group.uid
+        self._controller.view.refresh_visual_groups()
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        if self._group_uid:
+            self._controller._remove_visual_group(self._group_uid)
+            self._controller.view.refresh_visual_groups()
+            self._controller.make_dirty()
+
+
+class UngroupCommand(QUndoCommand):
+    def __init__(self, controller, group_uid: str):
+        super().__init__("Ungroup")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._group_snapshot: dict | None = None
+
+    def redo(self) -> None:
+        group = self._controller.project_state.get_visual_group(self._group_uid)
+        if group is not None:
+            self._group_snapshot = group.to_dict()
+            self._controller._remove_visual_group(self._group_uid)
+            if self._controller.view.current_view_group_uid == self._group_uid:
+                self._controller.view.exit_group_view()
+            self._controller.view.refresh_visual_groups()
+            self._controller.make_dirty()
+
+    def undo(self) -> None:
+        if self._group_snapshot:
+            group = VisualGroup.from_dict(self._group_snapshot)
+            self._controller.project_state.visual_groups.append(group)
+            self._controller.view.refresh_visual_groups()
+            self._controller.make_dirty()
 
 
 class EditBlockParamsCommand(QUndoCommand):

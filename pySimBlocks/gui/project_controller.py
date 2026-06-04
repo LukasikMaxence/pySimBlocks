@@ -42,10 +42,12 @@ from pySimBlocks.gui.undo_redo.commands import (
     AddBlockCommand,
     AddConnectionCommand,
     EditBlockParamsCommand,
+    GroupBlocksCommand,
     MoveResizeBlockCommand,
     RemoveBlockCommand,
     RemoveConnectionCommand,
     ToggleOrientationCommand,
+    UngroupCommand,
     ConnectionSnapshot,
 )
 
@@ -184,8 +186,8 @@ class ProjectController(QObject):
         """
         self.undo_manager.push(RemoveBlockCommand(self, block_instance))
 
-    def group_blocks(self, blocks: list[BlockInstance], name: str | None = None) -> VisualGroup:
-        """Create a visual group from an explicit block selection."""
+    def group_blocks(self, blocks: list[BlockInstance], name: str | None = None) -> VisualGroup | None:
+        """Create a visual group from an explicit block selection (undoable)."""
         unique_blocks: list[BlockInstance] = []
         seen = set()
         for block in blocks:
@@ -197,27 +199,33 @@ class ProjectController(QObject):
         if len(unique_blocks) < 2:
             raise ValueError("At least two blocks are required to create a group.")
 
-        member_uids = [b.uid for b in unique_blocks]
-        default_name = self._make_unique_group_name(name or "Group")
-        group = VisualGroup(
-            uid=uuid.uuid4().hex,
-            name=default_name,
-            members=member_uids,
-            parent_uid=None,
-            layout={},
-            boundary_ports=self._build_group_boundary_ports(member_uids),
-            child_group_uids=[],
-        )
-        self.project_state.visual_groups.append(group)
-        self.make_dirty()
-        return group
+        self.undo_manager.push(GroupBlocksCommand(self, unique_blocks, name))
+        member_uids = {b.uid for b in unique_blocks}
+        for group in reversed(self.project_state.visual_groups):
+            if set(group.members) == member_uids:
+                return group
+        return None
 
     def ungroup(self, group_uid: str) -> bool:
-        """Remove a visual group by UID."""
-        removed = self.project_state.remove_visual_group(group_uid)
-        if removed:
-            self.make_dirty()
-        return removed
+        """Remove a visual group by UID (undoable)."""
+        if self.project_state.get_visual_group(group_uid) is None:
+            return False
+        self.undo_manager.push(UngroupCommand(self, group_uid))
+        return True
+
+    def group_selected_blocks(self) -> VisualGroup | None:
+        """Group currently selected blocks in the diagram view."""
+        blocks = self.view.get_selected_block_instances()
+        if len(blocks) < 2:
+            return None
+        return self.group_blocks(blocks)
+
+    def ungroup_selected_group(self) -> bool:
+        """Ungroup the currently selected visual group."""
+        group_uid = self.view.get_selected_group_uid()
+        if group_uid is None:
+            return False
+        return self.ungroup(group_uid)
 
     def make_unique_name(self, base_name: str) -> str:
         """Return ``base_name`` or a suffixed variant that is unique across all blocks.
@@ -349,6 +357,7 @@ class ProjectController(QObject):
         """Reset the project state and diagram view to an empty state."""
         self.project_state.clear()
         self.view.clear_scene()
+        self.view.current_view_group_uid = None
         self.undo_manager.clear()
         self.clear_dirty()
 
@@ -376,6 +385,7 @@ class ProjectController(QObject):
                 project files and populates this controller.
         """
         loader.load(self, self.project_state.directory_path)
+        self.view.refresh_visual_groups()
 
 
     # --------------------------------------------------------------------------
@@ -522,6 +532,7 @@ class ProjectController(QObject):
         block_instance.resolve_ports()
         self.project_state.add_block(block_instance)
         self.view.add_block(block_instance, block_layout)
+        self.view.refresh_visual_groups()
 
         return block_instance
 
@@ -595,6 +606,7 @@ class ProjectController(QObject):
 
         self.project_state.remove_block(block_instance)
         self.view.remove_block(block_instance)
+        self.view.refresh_visual_groups()
 
     def _remove_connection(self, connection: ConnectionInstance) -> None:
         self.project_state.remove_connection(connection)
@@ -713,6 +725,62 @@ class ProjectController(QObject):
             self.view.refresh_block_port(block_instance)
             return removed
         return []
+
+    def _create_visual_group(
+        self,
+        blocks: list[BlockInstance],
+        name: str | None = None,
+    ) -> VisualGroup:
+        """Create and register a visual group without pushing undo."""
+        member_uids = [b.uid for b in blocks]
+        group = VisualGroup(
+            uid=uuid.uuid4().hex,
+            name=self._make_unique_group_name(name or "Group"),
+            members=member_uids,
+            parent_uid=None,
+            layout=self._compute_group_layout(member_uids),
+            boundary_ports=self._build_group_boundary_ports(member_uids),
+            child_group_uids=[],
+        )
+        self.project_state.visual_groups.append(group)
+        return group
+
+    def _remove_visual_group(self, group_uid: str) -> bool:
+        """Remove a visual group without pushing undo."""
+        return self.project_state.remove_visual_group(group_uid)
+
+    def _compute_group_layout(self, member_uids: list[str]) -> dict[str, float]:
+        """Compute a bounding layout for group members."""
+        margin = 16.0
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        found = False
+
+        for uid in member_uids:
+            block = self._find_block_by_uid(uid)
+            if block is None:
+                continue
+            item = self.view.get_block_item_from_instance(block)
+            if item is None:
+                continue
+            found = True
+            rect = item.sceneBoundingRect()
+            min_x = min(min_x, rect.left())
+            min_y = min(min_y, rect.top())
+            max_x = max(max_x, rect.right())
+            max_y = max(max_y, rect.bottom())
+
+        if not found:
+            return {"x": 0.0, "y": 0.0, "width": 160.0, "height": 100.0}
+
+        return {
+            "x": float(min_x - margin),
+            "y": float(min_y - margin),
+            "width": float(max(max_x - min_x + 2 * margin, 80.0)),
+            "height": float(max(max_y - min_y + 2 * margin, 50.0)),
+        }
 
     def _build_group_boundary_ports(self, member_uids: list[str]) -> list[BoundaryPort]:
         """Derive boundary ports from connections crossing group boundaries."""

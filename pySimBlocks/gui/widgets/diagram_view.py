@@ -24,9 +24,10 @@ from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QPointF, Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPainter, QPen
-from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
+from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QMenu
 
 from pySimBlocks.gui.graphics.block_item import BlockItem
+from pySimBlocks.gui.graphics.group_item import GroupItem
 from pySimBlocks.gui.graphics.connection_item import ConnectionItem, OrthogonalRoute
 from pySimBlocks.gui.graphics.port_item import PortItem
 from pySimBlocks.gui.graphics.theme import make_theme
@@ -84,7 +85,9 @@ class DiagramView(QGraphicsView):
         self.drop_event_pos: QPointF = QPointF(0, 0)
         self.project_controller: ProjectController | None
         self.block_items: dict[str, BlockItem] = {}
+        self.group_items: dict[str, GroupItem] = {}
         self.connections: dict[ConnectionInstance, ConnectionItem] = {}
+        self.current_view_group_uid: str | None = None
 
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
@@ -157,6 +160,132 @@ class DiagramView(QGraphicsView):
         connection_item = self.connections.pop(connection_instance, None)
         if connection_item:
             self.diagram_scene.removeItem(connection_item)
+
+    def get_selected_block_instances(self) -> list[BlockInstance]:
+        """Return block instances currently selected on the diagram."""
+        selected = []
+        for item in self.diagram_scene.selectedItems():
+            if isinstance(item, BlockItem):
+                selected.append(item.instance)
+        return selected
+
+    def get_selected_group_uid(self) -> str | None:
+        """Return the UID of a selected group item, if any."""
+        for item in self.diagram_scene.selectedItems():
+            if isinstance(item, GroupItem):
+                return item.group.uid
+        return None
+
+    def refresh_visual_groups(self) -> None:
+        """Sync group items, member visibility, and connection display."""
+        if self.project_controller is None:
+            return
+
+        state = self.project_controller.project_state
+        all_member_uids: set[str] = set()
+        for group in state.visual_groups:
+            all_member_uids.update(group.members)
+
+        active_uid = self.current_view_group_uid
+        active_group = state.get_visual_group(active_uid) if active_uid else None
+
+        known_group_uids = {g.uid for g in state.visual_groups}
+        for uid in list(self.group_items.keys()):
+            if uid not in known_group_uids:
+                item = self.group_items.pop(uid)
+                self.diagram_scene.removeItem(item)
+
+        for group in state.visual_groups:
+            item = self.group_items.get(group.uid)
+            if item is None:
+                item = GroupItem(group, self)
+                self.diagram_scene.addItem(item)
+                self.group_items[group.uid] = item
+            else:
+                item.group = group
+                item.sync_boundary_ports()
+                if group.layout:
+                    item.setPos(
+                        QPointF(
+                            float(group.layout.get("x", 0.0)),
+                            float(group.layout.get("y", 0.0)),
+                        )
+                    )
+                    item.setRect(
+                        0,
+                        0,
+                        float(group.layout.get("width", 160.0)),
+                        float(group.layout.get("height", 100.0)),
+                    )
+
+        if active_group is None:
+            for block_uid, block_item in self.block_items.items():
+                block_item.setVisible(block_uid not in all_member_uids)
+            for group_uid, group_item in self.group_items.items():
+                group_item.setVisible(True)
+        else:
+            member_set = set(active_group.members)
+            for block_uid, block_item in self.block_items.items():
+                block_item.setVisible(block_uid in member_set)
+            for group_uid, group_item in self.group_items.items():
+                group_item.setVisible(group_uid != active_group.uid)
+
+        for conn_inst, conn_item in self.connections.items():
+            src_uid = conn_inst.src_block().uid
+            dst_uid = conn_inst.dst_block().uid
+
+            if active_group is None:
+                src_in = src_uid in all_member_uids
+                dst_in = dst_uid in all_member_uids
+                visible = not (src_in and dst_in)
+            else:
+                members = set(active_group.members)
+                src_in = src_uid in members
+                dst_in = dst_uid in members
+                visible = src_in and dst_in or (src_in ^ dst_in)
+
+            conn_item.setVisible(visible)
+            if visible:
+                conn_item.update_position()
+
+    def connection_anchor_for_port_item(self, port_item: PortItem) -> QPointF:
+        """Return the scene anchor for a port, redirecting through group borders when collapsed."""
+        block_uid = port_item.instance.block.uid
+        port_name = port_item.instance.name
+
+        if self.current_view_group_uid is not None:
+            return port_item.connection_anchor()
+
+        for group_item in self.group_items.values():
+            if block_uid not in group_item.group.members:
+                continue
+            boundary_uid = group_item.find_boundary_for_member_port(block_uid, port_name)
+            if boundary_uid is None:
+                break
+            anchor = group_item.get_boundary_anchor(boundary_uid)
+            if anchor is not None:
+                return anchor
+
+        return port_item.connection_anchor()
+
+    def enter_group(self, group_uid: str) -> None:
+        """Open the internal view of a visual group."""
+        if self.project_controller is None:
+            return
+        if self.project_controller.project_state.get_visual_group(group_uid) is None:
+            return
+        self.current_view_group_uid = group_uid
+        self.refresh_visual_groups()
+
+    def exit_group_view(self) -> None:
+        """Return to the root diagram view."""
+        self.current_view_group_uid = None
+        self.refresh_visual_groups()
+
+    def on_group_moved(self, group_item: GroupItem) -> None:
+        """Refresh wires after a group container is moved."""
+        for conn_inst, conn_item in self.connections.items():
+            conn_item.update_position()
 
     def get_block_item_from_instance(self, block_instance: BlockInstance) -> BlockItem | None:
         """Return the visual BlockItem for the given block instance, or None.
@@ -290,6 +419,27 @@ class DiagramView(QGraphicsView):
             self.scale_view(1 / 1.15)
             return
 
+        # GROUP / UNGROUP
+        if (
+            event.key() == Qt.Key_G
+            and event.modifiers() == (Qt.ControlModifier | Qt.ShiftModifier)
+        ):
+            self.project_controller.group_selected_blocks()
+            event.accept()
+            return
+        if (
+            event.key() == Qt.Key_U
+            and event.modifiers() == (Qt.ControlModifier | Qt.ShiftModifier)
+        ):
+            self.project_controller.ungroup_selected_group()
+            event.accept()
+            return
+
+        if event.key() == Qt.Key_Escape and self.current_view_group_uid is not None:
+            self.exit_group_view()
+            event.accept()
+            return
+
         # ROTATE BLOCK
         if event.key() == Qt.Key_R and event.modifiers() & Qt.ControlModifier:
             selected = [i for i in self.diagram_scene.selectedItems()
@@ -353,6 +503,33 @@ class DiagramView(QGraphicsView):
         self.project_controller.add_connection(self.pending_port.instance, port.instance)
         self._cancel_temp_connection()
 
+    def contextMenuEvent(self, event) -> None:
+        """Show diagram context menu for grouping actions."""
+        if self.project_controller is None:
+            super().contextMenuEvent(event)
+            return
+
+        menu = QMenu(self)
+        selected_blocks = self.get_selected_block_instances()
+        selected_group_uid = self.get_selected_group_uid()
+
+        group_action = menu.addAction("Grouper")
+        group_action.setEnabled(len(selected_blocks) >= 2)
+        group_action.triggered.connect(self.project_controller.group_selected_blocks)
+
+        ungroup_action = menu.addAction("Dé-grouper")
+        ungroup_action.setEnabled(selected_group_uid is not None)
+        if selected_group_uid is not None:
+            ungroup_action.triggered.connect(
+                lambda: self.project_controller.ungroup(selected_group_uid)
+            )
+
+        if self.current_view_group_uid is not None:
+            exit_action = menu.addAction("Niveau supérieur")
+            exit_action.triggered.connect(self.exit_group_view)
+
+        menu.exec(event.globalPos())
+
     def delete_selected(self) -> None:
         """Remove all selected blocks and connections from the project."""
         selected_items = list(self.diagram_scene.selectedItems())
@@ -361,7 +538,9 @@ class DiagramView(QGraphicsView):
         self.project_controller.begin_macro("Delete Selection")
         try:
             for item in selected_items:
-                if isinstance(item, BlockItem):
+                if isinstance(item, GroupItem):
+                    self.project_controller.ungroup(item.group.uid)
+                elif isinstance(item, BlockItem):
                     self.project_controller.remove_block(item.instance)
                 elif isinstance(item, ConnectionItem):
                     self.project_controller.remove_connection(item.instance)
@@ -372,7 +551,9 @@ class DiagramView(QGraphicsView):
         """Remove all blocks and connections from the scene and reset state."""
         self.diagram_scene.clear()
         self.block_items.clear()
+        self.group_items.clear()
         self.connections.clear()
+        self.current_view_group_uid = None
         self.temp_connection = None
         self.pending_port = None
 
@@ -424,6 +605,9 @@ class DiagramView(QGraphicsView):
             conn.setPen(QPen(self.theme.wire, 2))
             conn.update_position()
             conn.update()
+
+        for group in self.group_items.values():
+            group.update()
 
     def _center_on_diagram(self) -> None:
         """Fit the view to the bounding rect of all scene items with a small margin."""
