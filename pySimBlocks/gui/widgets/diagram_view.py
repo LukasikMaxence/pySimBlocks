@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QMenu
 
@@ -203,20 +203,21 @@ class DiagramView(QGraphicsView):
                 self.group_items[group.uid] = item
             else:
                 item.group = group
-                item.sync_boundary_ports()
                 if group.layout:
-                    item.setPos(
+                    item.apply_geometry(
                         QPointF(
                             float(group.layout.get("x", 0.0)),
                             float(group.layout.get("y", 0.0)),
-                        )
+                        ),
+                        QRectF(
+                            0,
+                            0,
+                            float(group.layout.get("width", 160.0)),
+                            float(group.layout.get("height", 100.0)),
+                        ),
                     )
-                    item.setRect(
-                        0,
-                        0,
-                        float(group.layout.get("width", 160.0)),
-                        float(group.layout.get("height", 100.0)),
-                    )
+                else:
+                    item.sync_boundary_ports()
 
         if active_group is None:
             for block_uid, block_item in self.block_items.items():

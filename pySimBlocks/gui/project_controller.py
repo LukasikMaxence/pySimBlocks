@@ -329,6 +329,8 @@ class ProjectController(QObject):
         new_pos: QPointF,
         new_rect: QRectF,
     ) -> None:
+        if old_pos == new_pos and old_rect == new_rect:
+            return
         self.undo_manager.push(
             MoveResizeGroupCommand(
                 self, group_uid, old_pos, old_rect, new_pos, new_rect
@@ -691,18 +693,16 @@ class ProjectController(QObject):
         group = self.project_state.get_visual_group(group_uid)
         if group is None:
             return
-        group.layout = {
-            "x": float(pos.x()),
-            "y": float(pos.y()),
-            "width": float(rect.width()),
-            "height": float(rect.height()),
-        }
         group_item = self.view.group_items.get(group_uid)
         if group_item is None:
+            group.layout = {
+                "x": float(pos.x()),
+                "y": float(pos.y()),
+                "width": float(rect.width()),
+                "height": float(rect.height()),
+            }
             return
-        group_item.setPos(QPointF(pos))
-        group_item.setRect(0, 0, rect.width(), rect.height())
-        group_item.sync_boundary_ports()
+        group_item.apply_geometry(pos, rect)
         self.view.on_group_moved(group_item)
 
     def _set_block_geometry(self, block_uid: str, pos: QPointF, rect: QRectF) -> None:

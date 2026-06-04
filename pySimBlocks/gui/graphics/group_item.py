@@ -69,7 +69,6 @@ class GroupItem(QGraphicsRectItem):
 
     MIN_WIDTH = 80.0
     MIN_HEIGHT = 50.0
-    MARGIN = 16.0
     GRID_DX = 5
     GRID_DY = 5
     SELECTION_HANDLE_SIZE = 8
@@ -90,6 +89,7 @@ class GroupItem(QGraphicsRectItem):
         self._resize_start_height = height
         self._interaction_start_pos: QPointF | None = None
         self._interaction_start_rect: QRectF | None = None
+        self._syncing_geometry = False
 
         x = float(layout.get("x", 0.0))
         y = float(layout.get("y", 0.0))
@@ -216,7 +216,6 @@ class GroupItem(QGraphicsRectItem):
             self.setPos(QPointF(new_x, new_y))
             self.setRect(0, 0, new_w, new_h)
             self.sync_boundary_ports()
-            self._persist_layout()
             self.view.on_group_moved(self)
             self.update()
             event.accept()
@@ -250,19 +249,30 @@ class GroupItem(QGraphicsRectItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionChange and self.scene():
+            if self._syncing_geometry:
+                return value
             x = round(value.x() / self.GRID_DX) * self.GRID_DX
             y = round(value.y() / self.GRID_DY) * self.GRID_DY
             return QPointF(x, y)
 
-        if change == QGraphicsItem.ItemPositionHasChanged:
-            self._persist_layout()
+        if (
+            change == QGraphicsItem.ItemPositionHasChanged
+            and not self._syncing_geometry
+            and self._resize_handle is None
+        ):
             self.view.on_group_moved(self)
 
         return super().itemChange(change, value)
 
-    def _persist_layout(self) -> None:
-        pos = self.pos()
-        rect = self.rect()
+    def apply_geometry(self, pos: QPointF, rect: QRectF) -> None:
+        """Apply position and size without triggering layout side effects."""
+        self._syncing_geometry = True
+        try:
+            self.setRect(0, 0, rect.width(), rect.height())
+            self.setPos(QPointF(pos))
+            self.sync_boundary_ports()
+        finally:
+            self._syncing_geometry = False
         self.group.layout = {
             "x": float(pos.x()),
             "y": float(pos.y()),
