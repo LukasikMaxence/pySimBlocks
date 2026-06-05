@@ -273,15 +273,31 @@ class DiagramView(QGraphicsView):
         """Open the internal view of a visual group."""
         if self.project_controller is None:
             return
-        if self.project_controller.project_state.get_visual_group(group_uid) is None:
+        group = self.project_controller.project_state.get_visual_group(group_uid)
+        if group is None:
             return
+        if self.current_view_group_uid and self.current_view_group_uid != group_uid:
+            self._save_active_group_member_layouts()
         self.current_view_group_uid = group_uid
         self.refresh_visual_groups()
+        self.project_controller.apply_member_layouts(group)
 
     def exit_group_view(self) -> None:
         """Return to the root diagram view."""
+        self._save_active_group_member_layouts()
         self.current_view_group_uid = None
         self.refresh_visual_groups()
+
+    def _save_active_group_member_layouts(self) -> None:
+        """Persist block positions for the active internal group view."""
+        if self.project_controller is None or self.current_view_group_uid is None:
+            return
+        group = self.project_controller.project_state.get_visual_group(
+            self.current_view_group_uid
+        )
+        if group is None:
+            return
+        self.project_controller.save_member_layouts(group)
 
     def on_group_moved(self, group_item: GroupItem) -> None:
         """Refresh wires after a group container is moved."""
@@ -326,6 +342,17 @@ class DiagramView(QGraphicsView):
         Args:
             block_item: The block item that was repositioned.
         """
+        if self.current_view_group_uid and self.project_controller is not None:
+            group = self.project_controller.project_state.get_visual_group(
+                self.current_view_group_uid
+            )
+            if (
+                group is not None
+                and block_item.instance.uid in group.members
+            ):
+                group.member_layouts[block_item.instance.uid] = (
+                    self.project_controller._capture_block_layout(block_item.instance)
+                )
         for conn_inst, conn_item in self.connections.items():
             if conn_inst.is_block_involved(block_item.instance):
                 conn_item.invalidate_manual_route()

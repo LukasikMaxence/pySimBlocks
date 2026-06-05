@@ -163,15 +163,27 @@ class GroupBlocksCommand(QUndoCommand):
         self._blocks = list(blocks)
         self._name = name
         self._group_uid: str | None = None
+        self._group_snapshot: dict | None = None
 
     def redo(self) -> None:
-        group = self._controller._create_visual_group(self._blocks, self._name)
-        self._group_uid = group.uid
+        if self._group_snapshot is not None:
+            group = VisualGroup.from_dict(self._group_snapshot)
+            self._controller.project_state.visual_groups.append(group)
+            self._group_uid = group.uid
+        else:
+            group = self._controller._create_visual_group(self._blocks, self._name)
+            self._group_uid = group.uid
+            self._group_snapshot = group.to_dict()
         self._controller.view.refresh_visual_groups()
         self._controller.make_dirty()
 
     def undo(self) -> None:
         if self._group_uid:
+            group = self._controller.project_state.get_visual_group(self._group_uid)
+            if group is not None:
+                self._group_snapshot = group.to_dict()
+            if self._controller.view.current_view_group_uid == self._group_uid:
+                self._controller.view.exit_group_view()
             self._controller._remove_visual_group(self._group_uid)
             self._controller.view.refresh_visual_groups()
             self._controller.make_dirty()
@@ -188,9 +200,10 @@ class UngroupCommand(QUndoCommand):
         group = self._controller.project_state.get_visual_group(self._group_uid)
         if group is not None:
             self._group_snapshot = group.to_dict()
-            self._controller._remove_visual_group(self._group_uid)
             if self._controller.view.current_view_group_uid == self._group_uid:
                 self._controller.view.exit_group_view()
+            self._controller.restore_members_after_ungroup(group)
+            self._controller._remove_visual_group(self._group_uid)
             self._controller.view.refresh_visual_groups()
             self._controller.make_dirty()
 

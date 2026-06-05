@@ -62,6 +62,7 @@ class VisualGroup:
     layout: dict[str, float] = field(default_factory=dict)
     boundary_ports: list[BoundaryPort] = field(default_factory=list)
     child_group_uids: list[str] = field(default_factory=list)
+    member_layouts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the visual group to a YAML-friendly mapping."""
@@ -73,6 +74,9 @@ class VisualGroup:
             "layout": dict(self.layout),
             "boundary_ports": [port.to_dict() for port in self.boundary_ports],
             "child_group_uids": list(self.child_group_uids),
+            "member_layouts": {
+                uid: dict(layout) for uid, layout in self.member_layouts.items()
+            },
         }
         return out
 
@@ -104,6 +108,13 @@ class VisualGroup:
         if parent_uid is not None:
             parent_uid = str(parent_uid)
 
+        member_layouts_raw = data.get("member_layouts", {})
+        member_layouts: dict[str, dict[str, Any]] = {}
+        if isinstance(member_layouts_raw, dict):
+            for uid, member_layout in member_layouts_raw.items():
+                if isinstance(member_layout, dict):
+                    member_layouts[str(uid)] = dict(member_layout)
+
         return cls(
             uid=str(data.get("uid", "")),
             name=str(data.get("name", "")),
@@ -112,4 +123,5 @@ class VisualGroup:
             layout=dict(layout),
             boundary_ports=boundary_ports,
             child_group_uids=[str(c) for c in children],
+            member_layouts=member_layouts,
         )

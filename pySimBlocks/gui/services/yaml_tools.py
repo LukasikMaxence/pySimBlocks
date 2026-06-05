@@ -231,13 +231,17 @@ def _build_connections_section(project_state: ProjectState) -> tuple[list[dict],
 def _build_layout_section(
     block_items: dict[str, BlockItem],
     conn_name_map: dict[tuple[str, str], str],
+    hidden_member_uids: set[str] | None = None,
 ) -> dict:
     """Build the GUI layout section for a project YAML document."""
     data: dict = {"blocks": {}}
     manual_connections = {}
     seen = set()
+    hidden_member_uids = hidden_member_uids or set()
 
     for block in block_items.values():
+        if block.instance.uid in hidden_member_uids:
+            continue
         name = block.instance.name
         pos = block.pos()
         data["blocks"][name] = {
@@ -305,7 +309,10 @@ def build_project_yaml(
 
     blocks = _build_blocks_section(project_state)
     connections, conn_name_map = _build_connections_section(project_state)
-    layout = _build_layout_section(block_items, conn_name_map)
+    hidden_member_uids: set[str] = set()
+    for group in project_state.visual_groups:
+        hidden_member_uids.update(group.members)
+    layout = _build_layout_section(block_items, conn_name_map, hidden_member_uids)
     groups = _build_groups_section(project_state)
 
     return {

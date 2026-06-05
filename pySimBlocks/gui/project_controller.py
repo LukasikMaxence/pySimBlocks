@@ -774,6 +774,7 @@ class ProjectController(QObject):
             layout=self._compute_group_layout(member_uids),
             boundary_ports=self._build_group_boundary_ports(member_uids),
             child_group_uids=[],
+            member_layouts=self._capture_member_layouts(member_uids),
         )
         self.project_state.visual_groups.append(group)
         return group
@@ -781,6 +782,63 @@ class ProjectController(QObject):
     def _remove_visual_group(self, group_uid: str) -> bool:
         """Remove a visual group without pushing undo."""
         return self.project_state.remove_visual_group(group_uid)
+
+    def _capture_member_layouts(self, member_uids: list[str]) -> dict[str, dict[str, Any]]:
+        """Snapshot block item geometry for internal group view."""
+        layouts: dict[str, dict[str, Any]] = {}
+        for uid in member_uids:
+            block = self._find_block_by_uid(uid)
+            if block is None:
+                continue
+            item = self.view.get_block_item_from_instance(block)
+            if item is None:
+                continue
+            layouts[uid] = self._capture_block_layout(block)
+        return layouts
+
+    def _apply_block_layout(self, block_item, layout: dict[str, Any]) -> None:
+        """Apply a stored layout snapshot to a block item."""
+        block_item.setPos(QPointF(float(layout.get("x", 0.0)), float(layout.get("y", 0.0))))
+        block_item.setRect(
+            0,
+            0,
+            float(layout.get("width", block_item.rect().width())),
+            float(layout.get("height", block_item.rect().height())),
+        )
+        orientation = layout.get("orientation")
+        if isinstance(orientation, str):
+            block_item.orientation = orientation
+        block_item._layout_ports()
+        self.view.on_block_moved(block_item)
+
+    def apply_member_layouts(self, group: VisualGroup) -> None:
+        """Apply stored member layouts to visible block items."""
+        for uid in group.members:
+            layout = group.member_layouts.get(uid)
+            if not layout:
+                continue
+            block = self._find_block_by_uid(uid)
+            if block is None:
+                continue
+            item = self.view.get_block_item_from_instance(block)
+            if item is None:
+                continue
+            self._apply_block_layout(item, layout)
+
+    def save_member_layouts(self, group: VisualGroup) -> None:
+        """Persist current block item geometry into the group model."""
+        for uid in group.members:
+            block = self._find_block_by_uid(uid)
+            if block is None:
+                continue
+            item = self.view.get_block_item_from_instance(block)
+            if item is None:
+                continue
+            group.member_layouts[uid] = self._capture_block_layout(block)
+
+    def restore_members_after_ungroup(self, group: VisualGroup) -> None:
+        """Place ungrouped members using their internal layouts."""
+        self.apply_member_layouts(group)
 
     def _compute_group_layout(self, member_uids: list[str]) -> dict[str, float]:
         """Compute a bounding layout for group members."""
