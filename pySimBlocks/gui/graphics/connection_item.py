@@ -62,8 +62,9 @@ class ConnectionItem(QGraphicsPathItem):
     OFFSET = 8
     MARGIN = 12
     DETOUR = 8
-    PICK_TOL = 6
+    PICK_TOL = 10
     GRID = 5
+    AXIS_EPS = 0.5
 
     def __init__(self,
                  src_port: PortItem | None,
@@ -93,6 +94,8 @@ class ConnectionItem(QGraphicsPathItem):
         self._valid_port = src_port if src_port is not None else dst_port
         self.is_manual: bool = False
         self.route: OrthogonalRoute | None = None
+        self._route_drag_active = False
+        self._route_points_before_drag: list[QPointF] | None = None
 
         if points and len(points) >= 2:
             self.apply_manual_route(points)
@@ -110,7 +113,7 @@ class ConnectionItem(QGraphicsPathItem):
             pen = QPen(t.wire, 3, Qt.SolidLine)
 
         self.setPen(pen)
-        self.setZValue(1)
+        self.setZValue(2)
 
         self.update_position()
 
@@ -176,14 +179,14 @@ class ConnectionItem(QGraphicsPathItem):
         for i in range(len(pts) - 1):
             a, b = pts[i], pts[i + 1]
 
-            if a.x() == b.x():  # vertical
+            if abs(a.x() - b.x()) < self.AXIS_EPS:  # vertical
                 if abs(scene_pos.x() - a.x()) < self.PICK_TOL \
-                   and min(a.y(), b.y()) <= scene_pos.y() <= max(a.y(), b.y()):
+                   and min(a.y(), b.y()) - self.PICK_TOL <= scene_pos.y() <= max(a.y(), b.y()) + self.PICK_TOL:
                     return i
 
-            if a.y() == b.y():  # horizontal
+            elif abs(a.y() - b.y()) < self.AXIS_EPS:  # horizontal
                 if abs(scene_pos.y() - a.y()) < self.PICK_TOL \
-                   and min(a.x(), b.x()) <= scene_pos.x() <= max(a.x(), b.x()):
+                   and min(a.x(), b.x()) - self.PICK_TOL <= scene_pos.x() <= max(a.x(), b.x()) + self.PICK_TOL:
                     return i
         return None
 
@@ -194,30 +197,37 @@ class ConnectionItem(QGraphicsPathItem):
             Stroke path used for hit testing.
         """
         stroker = QPainterPathStroker()
-        stroker.setWidth(6)
+        stroker.setWidth(12)
         return stroker.createStroke(self.path())
 
     def mousePressEvent(self, event):
-        """Start manual segment dragging when pressing a routed segment.
-
-        Args:
-            event: Qt mouse-press event.
-        """
-        idx = self.segment_at(event.scenePos())
-        if idx is not None:
-            self.route.dragged_index = idx
-            self.is_manual = True
-            event.accept()
-        else:
-            super().mousePressEvent(event)
+        """Start manual segment dragging with the left mouse button."""
+        if event.button() == Qt.LeftButton:
+            idx = self.segment_at(event.scenePos())
+            if idx is not None:
+                if self.route is None:
+                    self.update_position()
+                if self.route is None:
+                    super().mousePressEvent(event)
+                    return
+                self._route_points_before_drag = [
+                    QPointF(point) for point in self.route.points
+                ]
+                self.route.dragged_index = idx
+                self.is_manual = True
+                self._route_drag_active = True
+                self.grabMouse()
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        """Move the selected orthogonal segment during manual route editing.
-
-        Args:
-            event: Qt mouse-move event.
-        """
+        """Move the selected orthogonal segment during manual route editing."""
         if not self.route or self.route.dragged_index is None:
+            super().mouseMoveEvent(event)
+            return
+
+        if not (event.buttons() & Qt.LeftButton):
             return
 
         i = self.route.dragged_index
@@ -225,12 +235,12 @@ class ConnectionItem(QGraphicsPathItem):
         b = self.route.points[i + 1]
         pos = event.scenePos()
 
-        if a.x() == b.x():  # vertical segment
+        if abs(a.x() - b.x()) < self.AXIS_EPS:  # vertical segment
             x = self._snap(pos.x())
             self.route.points[i]     = QPointF(x, a.y())
             self.route.points[i + 1] = QPointF(x, b.y())
 
-        elif a.y() == b.y():  # horizontal segment
+        elif abs(a.y() - b.y()) < self.AXIS_EPS:  # horizontal segment
             y = self._snap(pos.y())
             self.route.points[i]     = QPointF(a.x(), y)
             self.route.points[i + 1] = QPointF(b.x(), y)
@@ -238,14 +248,23 @@ class ConnectionItem(QGraphicsPathItem):
         self._apply_route(self.route.points)
 
     def mouseReleaseEvent(self, event):
-        """Finish manual segment dragging.
-
-        Args:
-            event: Qt mouse-release event.
-        """
+        """Finish manual segment dragging."""
+        was_dragging = self._route_drag_active
         if self.route:
             self.route.dragged_index = None
+        self._route_drag_active = False
+        if was_dragging:
+            self.ungrabMouse()
         super().mouseReleaseEvent(event)
+        if was_dragging and event.button() == Qt.LeftButton and self.route is not None:
+            view = self.src_port.parent_block.view
+            new_points = [QPointF(point) for point in self.route.points]
+            view.on_connection_route_edited(
+                self,
+                self._route_points_before_drag,
+                new_points,
+            )
+        self._route_points_before_drag = None
 
 
     # --------------------------------------------------------------------------
