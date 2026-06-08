@@ -37,6 +37,11 @@ from pySimBlocks.gui.services.simulation_runner import SimulationRunner
 from pySimBlocks.gui.services.yaml_tools import cleanup_runtime_project_yaml
 from pySimBlocks.gui.undo_redo.undo_redo_manager import UndoManager
 from pySimBlocks.gui.widgets.block_list import BlockList
+from pySimBlocks.gui.group_ports import (
+    GROUP_IN_TYPE,
+    GROUP_OUT_TYPE,
+    GROUP_PORTS_CATEGORY,
+)
 from pySimBlocks.gui.widgets.diagram_view import DiagramView
 from pySimBlocks.gui.widgets.toolbar_view import ToolBarView
 from pySimBlocks.tools.blocks_registry import load_block_registry
@@ -83,6 +88,7 @@ class MainWindow(QMainWindow):
         )
         self.view.project_controller = self.project_controller
         self.blocks = BlockList(self.get_categories, self.get_blocks, self.resolve_block_meta)
+        self.view.group_view_changed.connect(self.blocks.rebuild)
         self.toolbar = ToolBarView(self.saver, self.runner, self.project_controller)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -130,34 +136,22 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------------------
 
     def get_categories(self) -> List[str]:
-        """Return the sorted list of block categories from the registry.
-
-        Returns:
-            Sorted list of category name strings.
-        """
-        return sorted(self.block_registry.keys())
+        """Return the sorted list of block categories from the registry."""
+        categories = list(self.block_registry.keys())
+        if self.view.current_view_group_uid is not None:
+            categories.append(GROUP_PORTS_CATEGORY)
+        return sorted(categories)
 
     def get_blocks(self, category: str) -> List[str]:
-        """Return the sorted list of block type names within a category.
-
-        Args:
-            category: Category name to look up.
-
-        Returns:
-            Sorted list of block type name strings.
-        """
+        """Return the sorted list of block type names within a category."""
+        if category == GROUP_PORTS_CATEGORY:
+            return [GROUP_IN_TYPE, GROUP_OUT_TYPE]
         return sorted(self.block_registry.get(category, {}).keys())
 
     def resolve_block_meta(self, category: str, block_type: str) -> BlockMeta:
-        """Return the :class:`BlockMeta` for a given category and block type.
-
-        Args:
-            category: Category name of the block.
-            block_type: Type name of the block within the category.
-
-        Returns:
-            The :class:`BlockMeta` descriptor for the requested block.
-        """
+        """Return the :class:`BlockMeta` for a given category and block type."""
+        if category == GROUP_PORTS_CATEGORY:
+            raise KeyError("Group port palette entries are visual-only.")
         return self.block_registry[category][block_type]
 
 
