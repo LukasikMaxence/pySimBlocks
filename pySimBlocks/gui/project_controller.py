@@ -41,8 +41,11 @@ from pySimBlocks.gui.undo_redo.undo_redo_manager import UndoManager
 from pySimBlocks.gui.undo_redo.commands import (
     AddBlockCommand,
     AddConnectionCommand,
+    AddManualBoundaryCommand,
     EditBlockParamsCommand,
+    EditConnectionRouteCommand,
     GroupBlocksCommand,
+    MoveProxyLayoutCommand,
     MoveResizeBlockCommand,
     MoveResizeGroupCommand,
     RemoveBlockCommand,
@@ -347,6 +350,33 @@ class ProjectController(QObject):
             ToggleOrientationCommand(self, block_instance.uid, old_orientation, new_orientation)
         )
 
+    def execute_edit_connection_route(
+        self,
+        connection: ConnectionInstance,
+        old_points: list[QPointF] | None,
+        new_points: list[QPointF] | None,
+    ) -> None:
+        from pySimBlocks.gui.undo_redo.commands import routes_equal
+
+        if routes_equal(old_points, new_points):
+            return
+        self.undo_manager.push(
+            EditConnectionRouteCommand(self, connection, old_points, new_points)
+        )
+
+    def execute_move_proxy_layout(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        old_pos: QPointF,
+        new_pos: QPointF,
+    ) -> None:
+        if old_pos == new_pos:
+            return
+        self.undo_manager.push(
+            MoveProxyLayoutCommand(self, group_uid, boundary_uid, old_pos, new_pos)
+        )
+
     def begin_macro(self, text: str) -> None:
         self.undo_manager.stack.beginMacro(text)
 
@@ -363,6 +393,10 @@ class ProjectController(QObject):
         if not self.is_dirty:
             self.is_dirty = True
             self.dirty_changed.emit(True)
+
+    def mark_gui_layout_dirty(self) -> None:
+        """Mark GUI-only layout edits that stay outside the undo/redo stack."""
+        self.make_dirty()
 
     def clear_dirty(self) -> None:
         """Clear the unsaved-changes flag and emit :attr:`dirty_changed`."""
@@ -402,6 +436,8 @@ class ProjectController(QObject):
                 project files and populates this controller.
         """
         loader.load(self, self.project_state.directory_path)
+        for group in self.project_state.visual_groups:
+            self.ensure_group_boundary_proxies(group)
         self.view.refresh_visual_groups()
 
 
@@ -571,8 +607,9 @@ class ProjectController(QObject):
                 self.project_state.logging.append(sig)
 
     def _remove_block(self, block_instance: BlockInstance) -> None:
+        block_uid = block_instance.uid
         for connection in list(self.project_state.get_connections_of_block(block_instance)):
-            self._remove_connection(connection)
+            self._remove_connection(connection, refresh_boundaries=False)
 
         removed_signals = [
             f"{block_instance.name}.outputs.{p.name}"
@@ -623,11 +660,19 @@ class ProjectController(QObject):
 
         self.project_state.remove_block(block_instance)
         self.view.remove_block(block_instance)
-        self.view.refresh_visual_groups()
+        self._refresh_boundaries_for_member_uids({block_uid})
 
-    def _remove_connection(self, connection: ConnectionInstance) -> None:
+    def _remove_connection(
+        self,
+        connection: ConnectionInstance,
+        *,
+        refresh_boundaries: bool = True,
+    ) -> None:
+        block_uids = {connection.src_block().uid, connection.dst_block().uid}
         self.project_state.remove_connection(connection)
         self.view.remove_connection(connection)
+        if refresh_boundaries:
+            self._refresh_boundaries_for_member_uids(block_uids)
 
     def _find_block_by_uid(self, block_uid: str) -> BlockInstance | None:
         for block in self.project_state.blocks:
@@ -687,6 +732,9 @@ class ProjectController(QObject):
         connection_instance = ConnectionInstance(src_port, dst_port)
         self.project_state.add_connection(connection_instance)
         self.view.add_connection(connection_instance, snapshot.points)
+        self._refresh_boundaries_for_member_uids(
+            {src_port.block.uid, dst_port.block.uid}
+        )
         return connection_instance
 
     def _set_group_geometry(self, group_uid: str, pos: QPointF, rect: QRectF) -> None:
@@ -776,6 +824,7 @@ class ProjectController(QObject):
             child_group_uids=[],
             member_layouts=self._capture_member_layouts(member_uids),
         )
+        self.ensure_group_boundary_proxies(group)
         self.project_state.visual_groups.append(group)
         return group
 
@@ -840,6 +889,136 @@ class ProjectController(QObject):
         """Place ungrouped members using their internal layouts."""
         self.apply_member_layouts(group)
 
+    def ensure_group_boundary_proxies(self, group: VisualGroup) -> None:
+        """Assign proxy ids and default layouts for each group boundary port."""
+        inputs = [port for port in group.boundary_ports if port.direction == "input"]
+        outputs = [port for port in group.boundary_ports if port.direction == "output"]
+        for index, port in enumerate(inputs):
+            self._ensure_boundary_proxy(port, "input", index, len(inputs), group)
+        for index, port in enumerate(outputs):
+            self._ensure_boundary_proxy(port, "output", index, len(outputs), group)
+
+    def _ensure_boundary_proxy(
+        self,
+        boundary: BoundaryPort,
+        direction: str,
+        index: int,
+        total: int,
+        group: VisualGroup,
+    ) -> None:
+        if not boundary.proxy_uid:
+            boundary.proxy_uid = uuid.uuid4().hex
+        if not boundary.proxy_layout:
+            boundary.proxy_layout = self._default_proxy_layout(
+                direction, index, total, group
+            )
+
+    def _default_proxy_layout(
+        self,
+        direction: str,
+        index: int,
+        total: int,
+        group: VisualGroup,
+    ) -> dict[str, float]:
+        layout = group.layout or {}
+        height = float(layout.get("height", 100.0))
+        y = 20.0 + (index + 1) * max(40.0, height / (total + 1))
+        if direction == "input":
+            return {"x": 10.0, "y": y}
+        width = float(layout.get("width", 160.0))
+        return {"x": max(80.0, width - 66.0), "y": y}
+
+    def _apply_connection_route(
+        self,
+        connection: ConnectionInstance,
+        points: list[QPointF] | None,
+    ) -> None:
+        connection_item = self.view.connections.get(connection)
+        if connection_item is None:
+            return
+        if points is None or len(points) < 2:
+            connection_item.invalidate_manual_route()
+        else:
+            connection_item.apply_manual_route(points)
+        connection_item.update_position()
+
+    def save_proxy_layouts(self, group: VisualGroup) -> None:
+        """Persist current proxy item positions into the group model."""
+        for boundary in group.boundary_ports:
+            item = self.view.proxy_items.get(boundary.uid)
+            if item is None:
+                continue
+            pos = item.pos()
+            boundary.proxy_layout = {"x": float(pos.x()), "y": float(pos.y())}
+
+    def _add_manual_boundary_port(
+        self,
+        group_uid: str,
+        boundary: BoundaryPort,
+    ) -> None:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        if any(port.uid == boundary.uid for port in group.boundary_ports):
+            return
+        group.boundary_ports.append(boundary)
+        self.ensure_group_boundary_proxies(group)
+        self.view.refresh_visual_groups()
+
+    def _remove_manual_boundary_port(self, group_uid: str, boundary_uid: str) -> None:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        group.boundary_ports = [
+            port for port in group.boundary_ports if port.uid != boundary_uid
+        ]
+        proxy_item = self.view.proxy_items.pop(boundary_uid, None)
+        if proxy_item is not None:
+            self.view.diagram_scene.removeItem(proxy_item)
+        self.view.refresh_visual_groups()
+
+    def _set_proxy_layout(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        pos: QPointF,
+    ) -> None:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        boundary = next(
+            (port for port in group.boundary_ports if port.uid == boundary_uid),
+            None,
+        )
+        if boundary is None:
+            return
+        boundary.proxy_layout = {"x": float(pos.x()), "y": float(pos.y())}
+        proxy_item = self.view.proxy_items.get(boundary_uid)
+        if proxy_item is not None:
+            proxy_item.setPos(QPointF(pos))
+        for conn_item in self.view.connections.values():
+            conn_item.update_position()
+
+    def add_manual_boundary_port(
+        self,
+        group_uid: str,
+        direction: str,
+        pos: QPointF,
+    ) -> BoundaryPort | None:
+        """Add a manual GroupIn/GroupOut boundary port to a visual group."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return None
+        boundary = BoundaryPort(
+            uid=uuid.uuid4().hex,
+            direction=direction,
+            origin="manual",
+            proxy_uid=uuid.uuid4().hex,
+            proxy_layout={"x": float(pos.x()), "y": float(pos.y())},
+        )
+        self.undo_manager.push(AddManualBoundaryCommand(self, group_uid, boundary))
+        return boundary
+
     def _compute_group_layout(self, member_uids: list[str]) -> dict[str, float]:
         """Compute a bounding layout for group members."""
         margin = 16.0
@@ -901,12 +1080,69 @@ class ProjectController(QObject):
                 direction=direction,
                 linked_port_uid=f"{internal_port.block.uid}:{internal_port.name}",
                 origin="auto",
-                linked_connection_uid=f"{connection.src_block().uid}:{connection.src_port.name}->{connection.dst_block().uid}:{connection.dst_port.name}",
+                linked_connection_uid=self._connection_key(connection),
             )
             by_internal_port_uid[key] = boundary
             boundary_ports.append(boundary)
 
         return boundary_ports
+
+    def _connection_key(self, connection: ConnectionInstance) -> str:
+        """Build a stable key for one diagram connection."""
+        return (
+            f"{connection.src_block().uid}:{connection.src_port.name}->"
+            f"{connection.dst_block().uid}:{connection.dst_port.name}"
+        )
+
+    def _rebuild_group_boundary_ports(self, group: VisualGroup) -> None:
+        """Recompute auto boundary ports, keeping manual ports and stable auto ids."""
+        manual_ports = [port for port in group.boundary_ports if port.origin == "manual"]
+        existing_auto = {
+            port.linked_port_uid: port
+            for port in group.boundary_ports
+            if port.origin == "auto"
+        }
+
+        rebuilt_auto: list[BoundaryPort] = []
+        for port in self._build_group_boundary_ports(group.members):
+            previous = existing_auto.get(port.linked_port_uid)
+            if previous is not None:
+                port.uid = previous.uid
+                port.proxy_uid = previous.proxy_uid
+                port.proxy_layout = dict(previous.proxy_layout)
+            rebuilt_auto.append(port)
+
+        group.boundary_ports = manual_ports + rebuilt_auto
+        self.ensure_group_boundary_proxies(group)
+
+    def _group_needs_boundary_refresh(
+        self,
+        group: VisualGroup,
+        block_uids: set[str],
+    ) -> bool:
+        """Return whether a group may need boundary ports recomputed."""
+        members = set(group.members)
+        if members.intersection(block_uids):
+            return True
+
+        for connection in self.project_state.connections:
+            src_uid = connection.src_block().uid
+            dst_uid = connection.dst_block().uid
+            src_in = src_uid in members
+            dst_in = dst_uid in members
+            if src_in != dst_in and (src_uid in block_uids or dst_uid in block_uids):
+                return True
+        return False
+
+    def _refresh_boundaries_for_member_uids(self, block_uids: set[str]) -> None:
+        """Refresh boundary ports for groups affected by block or connection changes."""
+        changed = False
+        for group in self.project_state.visual_groups:
+            if self._group_needs_boundary_refresh(group, block_uids):
+                self._rebuild_group_boundary_ports(group)
+                changed = True
+        if changed:
+            self.view.refresh_visual_groups()
 
     def _make_unique_group_name(self, base_name: str) -> str:
         """Return a unique visual group name based on existing groups."""
