@@ -22,15 +22,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QMenu
 
 from pySimBlocks.gui.graphics.block_item import BlockItem
 from pySimBlocks.gui.graphics.group_item import GroupItem
+from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyItem
 from pySimBlocks.gui.graphics.connection_item import ConnectionItem, OrthogonalRoute
 from pySimBlocks.gui.graphics.port_item import PortItem
 from pySimBlocks.gui.graphics.theme import make_theme
+from pySimBlocks.gui.group_ports import GROUP_IN_TYPE, GROUP_OUT_TYPE, GROUP_PORTS_CATEGORY
 from pySimBlocks.gui.models.block_instance import BlockInstance
 from pySimBlocks.gui.models.connection_instance import ConnectionInstance
 
@@ -39,21 +41,9 @@ if TYPE_CHECKING:
 
 
 class DiagramView(QGraphicsView):
-    """Interactive Qt graphics view for the block diagram canvas.
+    """Interactive Qt graphics view for the block diagram canvas."""
 
-    Handles block/connection rendering, drag-and-drop, keyboard shortcuts,
-    zoom, and mouse-driven wire creation.
-
-    Attributes:
-        diagram_scene: The underlying QGraphicsScene.
-        theme: Current visual theme (colours, brushes).
-        pending_port: Port item waiting for a connection to be completed.
-        temp_connection: Temporary wire shown while dragging from a port.
-        copied_block: Most recently copied block, used for paste.
-        project_controller: Controller coordinating model mutations.
-        block_items: Mapping from block UID to its visual BlockItem.
-        connections: Mapping from ConnectionInstance to its visual ConnectionItem.
-    """
+    group_view_changed = Signal()
 
     def __init__(self):
         """Initialize the diagram view and configure scene behavior.
@@ -86,6 +76,7 @@ class DiagramView(QGraphicsView):
         self.project_controller: ProjectController | None
         self.block_items: dict[str, BlockItem] = {}
         self.group_items: dict[str, GroupItem] = {}
+        self.proxy_items: dict[str, GroupProxyItem] = {}
         self.connections: dict[ConnectionInstance, ConnectionItem] = {}
         self.current_view_group_uid: str | None = None
 
@@ -249,12 +240,50 @@ class DiagramView(QGraphicsView):
             if visible:
                 conn_item.update_position()
 
+        self._refresh_group_proxies(active_group)
+
+    def _refresh_group_proxies(self, active_group) -> None:
+        """Create or hide GroupIn/GroupOut proxy items for the active internal view."""
+        if active_group is None:
+            for item in self.proxy_items.values():
+                item.setVisible(False)
+            return
+
+        active_boundary_uids = {boundary.uid for boundary in active_group.boundary_ports}
+        for uid in list(self.proxy_items.keys()):
+            if uid not in active_boundary_uids:
+                item = self.proxy_items.pop(uid)
+                self.diagram_scene.removeItem(item)
+
+        for boundary in active_group.boundary_ports:
+            item = self.proxy_items.get(boundary.uid)
+            if item is None:
+                item = GroupProxyItem(boundary, self)
+                self.diagram_scene.addItem(item)
+                self.proxy_items[boundary.uid] = item
+            else:
+                item.boundary = boundary
+                if boundary.proxy_layout:
+                    item.setPos(
+                        QPointF(
+                            float(boundary.proxy_layout.get("x", 0.0)),
+                            float(boundary.proxy_layout.get("y", 0.0)),
+                        )
+                    )
+            item.setVisible(True)
+
     def connection_anchor_for_port_item(self, port_item: PortItem) -> QPointF:
         """Return the scene anchor for a port, redirecting through group borders when collapsed."""
         block_uid = port_item.instance.block.uid
         port_name = port_item.instance.name
 
-        if self.current_view_group_uid is not None:
+        active_uid = self.current_view_group_uid
+        if active_uid and self.project_controller is not None:
+            group = self.project_controller.project_state.get_visual_group(active_uid)
+            if group is not None:
+                external_anchor = self._proxy_anchor_for_external_port(group, port_item)
+                if external_anchor is not None:
+                    return external_anchor
             return port_item.connection_anchor()
 
         for group_item in self.group_items.values():
@@ -269,6 +298,64 @@ class DiagramView(QGraphicsView):
 
         return port_item.connection_anchor()
 
+    def _proxy_anchor_for_external_port(self, group, port_item: PortItem) -> QPointF | None:
+        """In internal view, attach crossing wires to GroupIn/GroupOut proxies."""
+        if self.project_controller is None:
+            return None
+
+        members = set(group.members)
+        port_instance = port_item.instance
+        for connection in self.project_controller.project_state.connections:
+            if connection.src_port is not port_instance and connection.dst_port is not port_instance:
+                continue
+
+            src_uid = connection.src_block().uid
+            dst_uid = connection.dst_block().uid
+            src_in = src_uid in members
+            dst_in = dst_uid in members
+            if src_in == dst_in:
+                continue
+
+            if dst_in:
+                member_uid, member_port_name = dst_uid, connection.dst_port.name
+                external_port = connection.src_port
+            else:
+                member_uid, member_port_name = src_uid, connection.src_port.name
+                external_port = connection.dst_port
+
+            if external_port is not port_instance:
+                continue
+
+            linked_key = f"{member_uid}:{member_port_name}"
+            for boundary in group.boundary_ports:
+                if boundary.linked_port_uid != linked_key:
+                    continue
+                proxy = self.proxy_items.get(boundary.uid)
+                if proxy is None:
+                    return None
+                return proxy.external_anchor()
+        return None
+
+    def on_proxy_moved(self, _proxy_item: GroupProxyItem) -> None:
+        """Refresh wires after a group proxy is moved."""
+        for conn_item in self.connections.values():
+            conn_item.update_position()
+
+    def on_connection_route_edited(
+        self,
+        connection_item: ConnectionItem,
+        old_points: list[QPointF] | None,
+        new_points: list[QPointF] | None,
+    ) -> None:
+        """Record a manual wire route edit on the undo/redo stack."""
+        if self.project_controller is not None:
+            self.project_controller.execute_edit_connection_route(
+                connection_item.instance,
+                old_points,
+                new_points,
+            )
+        connection_item.update_position()
+
     def enter_group(self, group_uid: str) -> None:
         """Open the internal view of a visual group."""
         if self.project_controller is None:
@@ -277,19 +364,22 @@ class DiagramView(QGraphicsView):
         if group is None:
             return
         if self.current_view_group_uid and self.current_view_group_uid != group_uid:
-            self._save_active_group_member_layouts()
+            self._save_active_group_view_state()
+        self.project_controller.ensure_group_boundary_proxies(group)
         self.current_view_group_uid = group_uid
         self.refresh_visual_groups()
         self.project_controller.apply_member_layouts(group)
+        self.group_view_changed.emit()
 
     def exit_group_view(self) -> None:
         """Return to the root diagram view."""
-        self._save_active_group_member_layouts()
+        self._save_active_group_view_state()
         self.current_view_group_uid = None
         self.refresh_visual_groups()
+        self.group_view_changed.emit()
 
-    def _save_active_group_member_layouts(self) -> None:
-        """Persist block positions for the active internal group view."""
+    def _save_active_group_view_state(self) -> None:
+        """Persist block and proxy positions for the active internal group view."""
         if self.project_controller is None or self.current_view_group_uid is None:
             return
         group = self.project_controller.project_state.get_visual_group(
@@ -298,6 +388,7 @@ class DiagramView(QGraphicsView):
         if group is None:
             return
         self.project_controller.save_member_layouts(group)
+        self.project_controller.save_proxy_layouts(group)
 
     def on_group_moved(self, group_item: GroupItem) -> None:
         """Refresh wires after a group container is moved."""
@@ -355,7 +446,6 @@ class DiagramView(QGraphicsView):
                 )
         for conn_inst, conn_item in self.connections.items():
             if conn_inst.is_block_involved(block_item.instance):
-                conn_item.invalidate_manual_route()
                 conn_item.update_position()
 
     def on_block_ports_refreshed(self, block_item: BlockItem) -> None:
@@ -393,7 +483,17 @@ class DiagramView(QGraphicsView):
         """
         self.drop_event_pos = self.mapToScene(event.position().toPoint())
         category, block_type = event.mimeData().text().split(":")
-        self.project_controller.add_block(category, block_type)
+        if category == GROUP_PORTS_CATEGORY:
+            if self.current_view_group_uid is None or self.project_controller is None:
+                return
+            direction = "input" if block_type == GROUP_IN_TYPE else "output"
+            self.project_controller.add_manual_boundary_port(
+                self.current_view_group_uid,
+                direction,
+                self.drop_event_pos,
+            )
+        else:
+            self.project_controller.add_block(category, block_type)
         event.acceptProposedAction()
 
     def keyPressEvent(self, event) -> None:
@@ -541,11 +641,11 @@ class DiagramView(QGraphicsView):
         selected_blocks = self.get_selected_block_instances()
         selected_group_uid = self.get_selected_group_uid()
 
-        group_action = menu.addAction("Grouper")
+        group_action = menu.addAction("Group")
         group_action.setEnabled(len(selected_blocks) >= 2)
         group_action.triggered.connect(self.project_controller.group_selected_blocks)
 
-        ungroup_action = menu.addAction("Dé-grouper")
+        ungroup_action = menu.addAction("Ungroup")
         ungroup_action.setEnabled(selected_group_uid is not None)
         if selected_group_uid is not None:
             ungroup_action.triggered.connect(
@@ -553,8 +653,12 @@ class DiagramView(QGraphicsView):
             )
 
         if self.current_view_group_uid is not None:
-            exit_action = menu.addAction("Niveau supérieur")
+            exit_action = menu.addAction("Go up")
             exit_action.triggered.connect(self.exit_group_view)
+            add_in = menu.addAction("Add input")
+            add_in.triggered.connect(self._add_manual_group_input)
+            add_out = menu.addAction("Add output")
+            add_out.triggered.connect(self._add_manual_group_output)
 
         menu.exec(event.globalPos())
 
@@ -580,6 +684,7 @@ class DiagramView(QGraphicsView):
         self.diagram_scene.clear()
         self.block_items.clear()
         self.group_items.clear()
+        self.proxy_items.clear()
         self.connections.clear()
         self.current_view_group_uid = None
         self.temp_connection = None
@@ -636,6 +741,25 @@ class DiagramView(QGraphicsView):
 
         for group in self.group_items.values():
             group.update()
+
+        for proxy in self.proxy_items.values():
+            proxy.update()
+
+    def _add_manual_group_input(self) -> None:
+        self._add_manual_group_boundary("input")
+
+    def _add_manual_group_output(self) -> None:
+        self._add_manual_group_boundary("output")
+
+    def _add_manual_group_boundary(self, direction: str) -> None:
+        if self.project_controller is None or self.current_view_group_uid is None:
+            return
+        origin = self.mapToScene(self.viewport().rect().center())
+        self.project_controller.add_manual_boundary_port(
+            self.current_view_group_uid,
+            direction,
+            origin,
+        )
 
     def _center_on_diagram(self) -> None:
         """Fit the view to the bounding rect of all scene items with a small margin."""
