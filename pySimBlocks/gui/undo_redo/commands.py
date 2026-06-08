@@ -26,7 +26,30 @@ from typing import Any
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QUndoCommand
 
-from pySimBlocks.gui.models import BlockInstance, PortInstance, VisualGroup
+from pySimBlocks.gui.models import BlockInstance, ConnectionInstance, PortInstance, VisualGroup
+from pySimBlocks.gui.models.visual_group import BoundaryPort
+
+
+def _clone_route_points(points: list[QPointF] | None) -> list[QPointF] | None:
+    if points is None:
+        return None
+    return [QPointF(point) for point in points]
+
+
+def routes_equal(
+    left: list[QPointF] | None,
+    right: list[QPointF] | None,
+) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    if len(left) != len(right):
+        return False
+    return all(
+        left_point.x() == right_point.x() and left_point.y() == right_point.y()
+        for left_point, right_point in zip(left, right)
+    )
 
 
 @dataclass
@@ -269,4 +292,78 @@ class EditBlockParamsCommand(QUndoCommand):
         )
         for snapshot in self._removed_connections:
             self._controller._add_connection_from_snapshot(snapshot)
+        self._controller.make_dirty()
+
+
+class EditConnectionRouteCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        connection_instance: ConnectionInstance,
+        old_points: list[QPointF] | None,
+        new_points: list[QPointF] | None,
+    ):
+        super().__init__("Edit Connection Route")
+        self._controller = controller
+        self._connection_instance = connection_instance
+        self._old_points = _clone_route_points(old_points)
+        self._new_points = _clone_route_points(new_points)
+
+    def redo(self) -> None:
+        self._controller._apply_connection_route(
+            self._connection_instance, self._new_points
+        )
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._apply_connection_route(
+            self._connection_instance, self._old_points
+        )
+        self._controller.make_dirty()
+
+
+class AddManualBoundaryCommand(QUndoCommand):
+    def __init__(self, controller, group_uid: str, boundary: BoundaryPort):
+        super().__init__("Add Group Port")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._boundary = boundary
+
+    def redo(self) -> None:
+        self._controller._add_manual_boundary_port(self._group_uid, self._boundary)
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._remove_manual_boundary_port(
+            self._group_uid, self._boundary.uid
+        )
+        self._controller.make_dirty()
+
+
+class MoveProxyLayoutCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        group_uid: str,
+        boundary_uid: str,
+        old_pos: QPointF,
+        new_pos: QPointF,
+    ):
+        super().__init__("Move Group Port")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._boundary_uid = boundary_uid
+        self._old_pos = QPointF(old_pos)
+        self._new_pos = QPointF(new_pos)
+
+    def redo(self) -> None:
+        self._controller._set_proxy_layout(
+            self._group_uid, self._boundary_uid, self._new_pos
+        )
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._set_proxy_layout(
+            self._group_uid, self._boundary_uid, self._old_pos
+        )
         self._controller.make_dirty()
