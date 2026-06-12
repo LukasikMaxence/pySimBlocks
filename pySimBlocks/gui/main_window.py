@@ -25,7 +25,7 @@ from typing import List
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import QMainWindow, QSplitter
+from PySide6.QtWidgets import QMainWindow, QSplitter, QVBoxLayout, QWidget
 
 from pySimBlocks.gui.blocks.block_meta import BlockMeta
 from pySimBlocks.gui.dialogs.unsaved_dialog import UnsavedChangesDialog
@@ -44,6 +44,7 @@ from pySimBlocks.gui.group_ports import (
 )
 from pySimBlocks.gui.widgets.diagram_view import DiagramView
 from pySimBlocks.gui.widgets.toolbar_view import ToolBarView
+from pySimBlocks.gui.widgets.view_navigation_bar import ViewNavigationBar
 from pySimBlocks.tools.blocks_registry import load_block_registry
 
 
@@ -89,12 +90,23 @@ class MainWindow(QMainWindow):
         self.view.project_controller = self.project_controller
         self.blocks = BlockList(self.get_categories, self.get_blocks, self.resolve_block_meta)
         self.view.group_view_changed.connect(self.blocks.rebuild)
+        self.nav_bar = ViewNavigationBar(self._resolve_group_name_for_nav)
+        self.view.view_stack_changed.connect(self._update_view_navigation_bar)
+        self.nav_bar.navigate_requested.connect(self.view.navigate_to_depth)
         self.toolbar = ToolBarView(self.saver, self.runner, self.project_controller)
+
+        diagram_panel = QWidget()
+        diagram_layout = QVBoxLayout(diagram_panel)
+        diagram_layout.setContentsMargins(0, 0, 0, 0)
+        diagram_layout.setSpacing(0)
+        diagram_layout.addWidget(self.nav_bar)
+        diagram_layout.addWidget(self.view, 1)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.blocks)
-        splitter.addWidget(self.view)
+        splitter.addWidget(diagram_panel)
         splitter.setSizes([180, 800])
+        self._update_view_navigation_bar()
 
         self.setCentralWidget(splitter)
         self.addToolBar(self.toolbar)
@@ -134,6 +146,13 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------------------
     # Registry
     # --------------------------------------------------------------------------
+
+    def _resolve_group_name_for_nav(self, group_uid: str) -> str | None:
+        group = self.project_state.get_visual_group(group_uid)
+        return group.name if group is not None else None
+
+    def _update_view_navigation_bar(self) -> None:
+        self.nav_bar.set_view_stack(self.view.view_stack)
 
     def get_categories(self) -> List[str]:
         """Return the sorted list of block categories from the registry."""

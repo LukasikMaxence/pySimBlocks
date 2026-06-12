@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 class GroupProxyPortItem(QGraphicsItem):
-    """Single connection anchor on a GroupIn / GroupOut proxy block."""
+    """Single visible port on a GroupIn or GroupOut proxy block."""
 
     R = 6
     L = 15
@@ -57,10 +57,16 @@ class GroupProxyPortItem(QGraphicsItem):
 
 
 class GroupProxyItem(QGraphicsRectItem):
-    """Render a GroupIn or GroupOut proxy inside a visual group."""
+    """Render a GroupIn or GroupOut proxy inside a visual group.
+
+    GroupIn exposes only an output toward group members; its external input
+    lives on the parent GroupItem border. GroupOut exposes only an input from
+    members; its external output lives on the parent GroupItem border.
+    """
 
     WIDTH = 56.0
-    HEIGHT = 36.0
+    HEIGHT = 45.0
+    TYPE_LABEL_MIN_HEIGHT = 40.0
     GRID_DX = 5
     GRID_DY = 5
 
@@ -68,21 +74,15 @@ class GroupProxyItem(QGraphicsRectItem):
         super().__init__(0, 0, self.WIDTH, self.HEIGHT)
         self.boundary = boundary
         self.view = view
-        if self.is_group_in:
-            self.external_port = GroupProxyPortItem(is_output=False, parent_proxy=self)
-            self.member_port = GroupProxyPortItem(is_output=True, parent_proxy=self)
-        else:
-            self.member_port = GroupProxyPortItem(is_output=False, parent_proxy=self)
-            self.external_port = GroupProxyPortItem(is_output=True, parent_proxy=self)
-
         rect = self.rect()
         mid_y = rect.height() / 2
+
         if self.is_group_in:
-            self.external_port.setPos(0, mid_y)
-            self.member_port.setPos(rect.width(), mid_y)
+            self.port_item = GroupProxyPortItem(is_output=True, parent_proxy=self)
+            self.port_item.setPos(rect.width(), mid_y)
         else:
-            self.member_port.setPos(0, mid_y)
-            self.external_port.setPos(rect.width(), mid_y)
+            self.port_item = GroupProxyPortItem(is_output=False, parent_proxy=self)
+            self.port_item.setPos(0, mid_y)
 
         layout = boundary.proxy_layout or {}
         self.setPos(QPointF(float(layout.get("x", 0.0)), float(layout.get("y", 0.0))))
@@ -101,27 +101,52 @@ class GroupProxyItem(QGraphicsRectItem):
         return self.boundary.direction == "output"
 
     @property
-    def label(self) -> str:
+    def kind_label(self) -> str:
         return "In" if self.is_group_in else "Out"
 
-    def member_anchor(self) -> QPointF:
-        """Anchor facing group members (GroupIn out, GroupOut in)."""
-        return self.member_port.connection_anchor()
+    def center_label(self) -> str:
+        """External flow label (source for In, destination for Out), or In/Out."""
+        controller = self.view.project_controller
+        group_uid = self.view.current_view_group_uid
+        if controller is None or group_uid is None:
+            return self.kind_label
+        group = controller.project_state.get_visual_group(group_uid)
+        if group is None:
+            return self.kind_label
+        text = controller.boundary_port_flow_label(group, self.boundary)
+        return text if text else self.kind_label
 
-    def external_anchor(self) -> QPointF:
-        """Anchor facing the parent diagram (GroupIn in, GroupOut out)."""
-        return self.external_port.connection_anchor()
+    def member_anchor(self) -> QPointF:
+        """Anchor used for wires between the proxy and group members."""
+        return self.port_item.connection_anchor()
 
     def paint(self, painter, option, widget=None):
         t = self.view.theme
         selected = bool(option.state & QStyle.State_Selected)
+        rect = self.rect()
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setBrush(QBrush(t.block_bg_selected if selected else t.block_bg))
         painter.setPen(QPen(t.block_border_selected if selected else t.block_border, 2))
-        painter.drawRect(self.rect())
+        painter.drawRect(rect)
+
+        name_font = QFont("Sans Serif", 9)
+        painter.setFont(name_font)
         painter.setPen(QPen(t.text_selected if selected else t.text))
-        painter.setFont(QFont("Sans Serif", 8, QFont.Bold))
-        painter.drawText(self.rect(), int(Qt.AlignCenter), self.label)
+        name_rect = QRectF(rect.x(), rect.y(), rect.width(), rect.height() * 0.60)
+        painter.drawText(name_rect, int(Qt.AlignCenter | Qt.AlignBottom), self.center_label())
+
+        if rect.height() >= self.TYPE_LABEL_MIN_HEIGHT:
+            type_font = QFont("Sans Serif", 8)
+            type_font.setItalic(True)
+            painter.setFont(type_font)
+            painter.setPen(QPen(t.text_type_selected if selected else t.text_type))
+            type_rect = QRectF(
+                rect.x(),
+                rect.y() + rect.height() * 0.58,
+                rect.width(),
+                rect.height() * 0.38,
+            )
+            painter.drawText(type_rect, int(Qt.AlignCenter | Qt.AlignTop), self.kind_label)
 
     def mousePressEvent(self, event):
         self._interaction_start_pos = QPointF(self.pos())

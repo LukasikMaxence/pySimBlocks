@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPainter, QPen
-from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QMenu
+from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QInputDialog, QMenu
 
 from pySimBlocks.gui.graphics.block_item import BlockItem
 from pySimBlocks.gui.graphics.group_item import GroupItem
@@ -44,6 +44,7 @@ class DiagramView(QGraphicsView):
     """Interactive Qt graphics view for the block diagram canvas."""
 
     group_view_changed = Signal()
+    view_stack_changed = Signal()
 
     def __init__(self):
         """Initialize the diagram view and configure scene behavior.
@@ -78,7 +79,7 @@ class DiagramView(QGraphicsView):
         self.group_items: dict[str, GroupItem] = {}
         self.proxy_items: dict[str, GroupProxyItem] = {}
         self.connections: dict[ConnectionInstance, ConnectionItem] = {}
-        self.current_view_group_uid: str | None = None
+        self.view_stack: list[str] = []
 
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
@@ -112,6 +113,7 @@ class DiagramView(QGraphicsView):
         block_item = self.get_block_item_from_instance(block_instance)
         if block_item:
             block_item.refresh_ports()
+            self._refresh_group_port_labels()
 
     def remove_block(self, block_instance: BlockInstance) -> None:
         """Remove the visual block item for the given instance from the scene.
@@ -167,6 +169,68 @@ class DiagramView(QGraphicsView):
                 return item.group.uid
         return None
 
+    @property
+    def current_view_group_uid(self) -> str | None:
+        """UID of the innermost group in the current view stack."""
+        return self.view_stack[-1] if self.view_stack else None
+
+    def _group_path_uids(self, group_uid: str) -> list[str]:
+        """Build the root-to-group UID path using parent_group_uid links."""
+        if self.project_controller is None:
+            return [group_uid]
+        state = self.project_controller.project_state
+        path: list[str] = []
+        uid: str | None = group_uid
+        while uid:
+            group = state.get_visual_group(uid)
+            if group is None:
+                return [group_uid]
+            path.append(uid)
+            uid = group.parent_uid
+        path.reverse()
+        return path
+
+    def _activate_view_stack(self) -> None:
+        """Apply the current view stack to the scene."""
+        if self.project_controller is None:
+            return
+        if self.view_stack:
+            group_uid = self.view_stack[-1]
+            group = self.project_controller.project_state.get_visual_group(group_uid)
+            if group is None:
+                self.view_stack = []
+            else:
+                self.project_controller.ensure_group_boundary_proxies(group)
+                self.refresh_visual_groups()
+                self.project_controller.apply_member_layouts(group)
+                self.group_view_changed.emit()
+                self.view_stack_changed.emit()
+                return
+        self.refresh_visual_groups()
+        self.group_view_changed.emit()
+        self.view_stack_changed.emit()
+
+    def navigate_to_depth(self, depth: int) -> None:
+        """Navigate to a breadcrumb depth (0 = root diagram)."""
+        depth = max(0, min(depth, len(self.view_stack)))
+        if depth == len(self.view_stack):
+            return
+        self._save_active_group_view_state()
+        self.view_stack = self.view_stack[:depth]
+        self._activate_view_stack()
+
+    def navigate_out_of_group(self, group_uid: str) -> None:
+        """Leave a group and its nested views in the navigation stack."""
+        if group_uid not in self.view_stack:
+            return
+        self.navigate_to_depth(self.view_stack.index(group_uid))
+
+    def pop_view_level(self) -> None:
+        """Go up one level in the navigation stack."""
+        if not self.view_stack:
+            return
+        self.navigate_to_depth(len(self.view_stack) - 1)
+
     def refresh_visual_groups(self) -> None:
         """Sync group items, member visibility, and connection display."""
         if self.project_controller is None:
@@ -217,10 +281,11 @@ class DiagramView(QGraphicsView):
                 group_item.setVisible(True)
         else:
             member_set = set(active_group.members)
+            child_groups = set(active_group.child_group_uids)
             for block_uid, block_item in self.block_items.items():
                 block_item.setVisible(block_uid in member_set)
             for group_uid, group_item in self.group_items.items():
-                group_item.setVisible(group_uid != active_group.uid)
+                group_item.setVisible(group_uid in child_groups)
 
         for conn_inst, conn_item in self.connections.items():
             src_uid = conn_inst.src_block().uid
@@ -241,6 +306,14 @@ class DiagramView(QGraphicsView):
                 conn_item.update_position()
 
         self._refresh_group_proxies(active_group)
+        self._refresh_group_port_labels()
+
+    def _refresh_group_port_labels(self) -> None:
+        """Refresh boundary and proxy labels after connection changes."""
+        for group_item in self.group_items.values():
+            group_item.refresh_boundary_port_labels()
+        for proxy_item in self.proxy_items.values():
+            proxy_item.update()
 
     def _refresh_group_proxies(self, active_group) -> None:
         """Create or hide GroupIn/GroupOut proxy items for the active internal view."""
@@ -299,7 +372,7 @@ class DiagramView(QGraphicsView):
         return port_item.connection_anchor()
 
     def _proxy_anchor_for_external_port(self, group, port_item: PortItem) -> QPointF | None:
-        """In internal view, attach crossing wires to GroupIn/GroupOut proxies."""
+        """In internal view, attach crossing wires to the member-facing proxy port."""
         if self.project_controller is None:
             return None
 
@@ -333,7 +406,7 @@ class DiagramView(QGraphicsView):
                 proxy = self.proxy_items.get(boundary.uid)
                 if proxy is None:
                     return None
-                return proxy.external_anchor()
+                return proxy.member_anchor()
         return None
 
     def on_proxy_moved(self, _proxy_item: GroupProxyItem) -> None:
@@ -360,23 +433,18 @@ class DiagramView(QGraphicsView):
         """Open the internal view of a visual group."""
         if self.project_controller is None:
             return
-        group = self.project_controller.project_state.get_visual_group(group_uid)
-        if group is None:
+        if self.project_controller.project_state.get_visual_group(group_uid) is None:
             return
-        if self.current_view_group_uid and self.current_view_group_uid != group_uid:
-            self._save_active_group_view_state()
-        self.project_controller.ensure_group_boundary_proxies(group)
-        self.current_view_group_uid = group_uid
-        self.refresh_visual_groups()
-        self.project_controller.apply_member_layouts(group)
-        self.group_view_changed.emit()
+        new_stack = self._group_path_uids(group_uid)
+        if new_stack == self.view_stack:
+            return
+        self._save_active_group_view_state()
+        self.view_stack = new_stack
+        self._activate_view_stack()
 
     def exit_group_view(self) -> None:
-        """Return to the root diagram view."""
-        self._save_active_group_view_state()
-        self.current_view_group_uid = None
-        self.refresh_visual_groups()
-        self.group_view_changed.emit()
+        """Go up one level in the navigation stack."""
+        self.pop_view_level()
 
     def _save_active_group_view_state(self) -> None:
         """Persist block and proxy positions for the active internal group view."""
@@ -563,7 +631,7 @@ class DiagramView(QGraphicsView):
             event.accept()
             return
 
-        if event.key() == Qt.Key_Escape and self.current_view_group_uid is not None:
+        if event.key() == Qt.Key_Escape and self.view_stack:
             self.exit_group_view()
             event.accept()
             return
@@ -640,17 +708,33 @@ class DiagramView(QGraphicsView):
         menu = QMenu(self)
         selected_blocks = self.get_selected_block_instances()
         selected_group_uid = self.get_selected_group_uid()
+        clicked_group = self._group_item_at(event)
+        target_group_uid = (
+            clicked_group.group.uid if clicked_group is not None else selected_group_uid
+        )
 
         group_action = menu.addAction("Group")
         group_action.setEnabled(len(selected_blocks) >= 2)
-        group_action.triggered.connect(self.project_controller.group_selected_blocks)
+        group_action.triggered.connect(
+            lambda *_args: self.project_controller.group_selected_blocks()
+        )
 
-        ungroup_action = menu.addAction("Ungroup")
-        ungroup_action.setEnabled(selected_group_uid is not None)
-        if selected_group_uid is not None:
-            ungroup_action.triggered.connect(
-                lambda: self.project_controller.ungroup(selected_group_uid)
+        if target_group_uid is not None:
+            enter_action = menu.addAction("Enter")
+            enter_action.triggered.connect(
+                lambda *_args, uid=target_group_uid: self.enter_group(uid)
             )
+            rename_action = menu.addAction("Rename")
+            rename_action.triggered.connect(
+                lambda *_args, uid=target_group_uid: self._rename_group(uid)
+            )
+            ungroup_action = menu.addAction("Ungroup")
+            ungroup_action.triggered.connect(
+                lambda *_args, uid=target_group_uid: self.project_controller.ungroup(uid)
+            )
+        else:
+            ungroup_action = menu.addAction("Ungroup")
+            ungroup_action.setEnabled(False)
 
         if self.current_view_group_uid is not None:
             exit_action = menu.addAction("Go up")
@@ -686,9 +770,10 @@ class DiagramView(QGraphicsView):
         self.group_items.clear()
         self.proxy_items.clear()
         self.connections.clear()
-        self.current_view_group_uid = None
+        self.view_stack = []
         self.temp_connection = None
         self.pending_port = None
+        self.view_stack_changed.emit()
 
     def scale_view(self, factor: float) -> None:
         """Scale the view by ``factor``, clamped to the allowed zoom range.
@@ -741,6 +826,9 @@ class DiagramView(QGraphicsView):
 
         for group in self.group_items.values():
             group.update()
+            group.refresh_boundary_port_labels()
+            for boundary_item in group.boundary_port_items.values():
+                boundary_item.label.setDefaultTextColor(self.theme.text)
 
         for proxy in self.proxy_items.values():
             proxy.update()
@@ -750,6 +838,32 @@ class DiagramView(QGraphicsView):
 
     def _add_manual_group_output(self) -> None:
         self._add_manual_group_boundary("output")
+
+    def _group_item_at(self, event) -> GroupItem | None:
+        if hasattr(event, "position"):
+            view_pos = event.position().toPoint()
+        else:
+            view_pos = event.pos()
+        pos = self.mapToScene(view_pos)
+        for item in self.diagram_scene.items(pos):
+            if isinstance(item, GroupItem):
+                return item
+        return None
+
+    def _rename_group(self, group_uid: str) -> None:
+        if self.project_controller is None:
+            return
+        group = self.project_controller.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Rename Group",
+            "Group name:",
+            text=group.name,
+        )
+        if accepted:
+            self.project_controller.rename_visual_group(group_uid, new_name)
 
     def _add_manual_group_boundary(self, direction: str) -> None:
         if self.project_controller is None or self.current_view_group_uid is None:

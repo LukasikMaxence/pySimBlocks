@@ -34,6 +34,7 @@ from pySimBlocks.gui.models import (
     ProjectState,
     VisualGroup,
 )
+from pySimBlocks.gui.group_boundary_labels import boundary_port_label
 from pySimBlocks.gui.widgets.diagram_view import DiagramView
 from pySimBlocks.gui.blocks.block_meta import BlockMeta
 from pySimBlocks.gui.services.yaml_tools import cleanup_runtime_project_yaml
@@ -50,6 +51,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     MoveResizeGroupCommand,
     RemoveBlockCommand,
     RemoveConnectionCommand,
+    RenameGroupCommand,
     ToggleOrientationCommand,
     UngroupCommand,
     ConnectionSnapshot,
@@ -231,6 +233,28 @@ class ProjectController(QObject):
             return False
         return self.ungroup(group_uid)
 
+    def boundary_port_flow_label(
+        self,
+        group: VisualGroup,
+        boundary: BoundaryPort,
+    ) -> str:
+        """Return the flow label for a boundary (source for In, destination for Out)."""
+        return boundary_port_label(self.project_state, group, boundary)
+
+    def rename_visual_group(self, group_uid: str, new_name: str) -> bool:
+        """Rename a visual group (undoable)."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        trimmed = new_name.strip()
+        if not trimmed or trimmed == group.name:
+            return False
+        unique_name = self._make_unique_group_name(trimmed, exclude_uid=group_uid)
+        self.undo_manager.push(
+            RenameGroupCommand(self, group_uid, group.name, unique_name)
+        )
+        return True
+
     def make_unique_name(self, base_name: str) -> str:
         """Return ``base_name`` or a suffixed variant that is unique across all blocks.
 
@@ -408,7 +432,8 @@ class ProjectController(QObject):
         """Reset the project state and diagram view to an empty state."""
         self.project_state.clear()
         self.view.clear_scene()
-        self.view.current_view_group_uid = None
+        self.view.view_stack = []
+        self.view.view_stack_changed.emit()
         self.undo_manager.clear()
         self.clear_dirty()
 
@@ -1144,9 +1169,17 @@ class ProjectController(QObject):
         if changed:
             self.view.refresh_visual_groups()
 
-    def _make_unique_group_name(self, base_name: str) -> str:
+    def _make_unique_group_name(
+        self,
+        base_name: str,
+        exclude_uid: str | None = None,
+    ) -> str:
         """Return a unique visual group name based on existing groups."""
-        existing = {g.name for g in self.project_state.visual_groups}
+        existing = {
+            g.name
+            for g in self.project_state.visual_groups
+            if g.uid != exclude_uid
+        }
         if base_name not in existing:
             return base_name
         i = 1

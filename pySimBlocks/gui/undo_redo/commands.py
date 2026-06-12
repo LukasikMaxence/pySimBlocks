@@ -205,8 +205,8 @@ class GroupBlocksCommand(QUndoCommand):
             group = self._controller.project_state.get_visual_group(self._group_uid)
             if group is not None:
                 self._group_snapshot = group.to_dict()
-            if self._controller.view.current_view_group_uid == self._group_uid:
-                self._controller.view.exit_group_view()
+            if self._group_uid in self._controller.view.view_stack:
+                self._controller.view.navigate_out_of_group(self._group_uid)
             self._controller._remove_visual_group(self._group_uid)
             self._controller.view.refresh_visual_groups()
             self._controller.make_dirty()
@@ -223,8 +223,8 @@ class UngroupCommand(QUndoCommand):
         group = self._controller.project_state.get_visual_group(self._group_uid)
         if group is not None:
             self._group_snapshot = group.to_dict()
-            if self._controller.view.current_view_group_uid == self._group_uid:
-                self._controller.view.exit_group_view()
+            if self._group_uid in self._controller.view.view_stack:
+                self._controller.view.navigate_out_of_group(self._group_uid)
             self._controller.restore_members_after_ungroup(group)
             self._controller._remove_visual_group(self._group_uid)
             self._controller.view.refresh_visual_groups()
@@ -366,4 +366,31 @@ class MoveProxyLayoutCommand(QUndoCommand):
         self._controller._set_proxy_layout(
             self._group_uid, self._boundary_uid, self._old_pos
         )
+        self._controller.make_dirty()
+
+
+class RenameGroupCommand(QUndoCommand):
+    def __init__(self, controller, group_uid: str, old_name: str, new_name: str):
+        super().__init__("Rename Group")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._old_name = old_name
+        self._new_name = new_name
+
+    def redo(self) -> None:
+        group = self._controller.project_state.get_visual_group(self._group_uid)
+        if group is None:
+            return
+        group.name = self._new_name
+        self._controller.view.refresh_visual_groups()
+        self._controller.view.view_stack_changed.emit()
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        group = self._controller.project_state.get_visual_group(self._group_uid)
+        if group is None:
+            return
+        group.name = self._old_name
+        self._controller.view.refresh_visual_groups()
+        self._controller.view.view_stack_changed.emit()
         self._controller.make_dirty()

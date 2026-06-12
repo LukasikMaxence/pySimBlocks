@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QPainterPath
 from PySide6.QtGui import QBrush, QFont, QPainter, QPen
-from PySide6.QtWidgets import QGraphicsItem, QGraphicsRectItem, QStyle
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsRectItem, QGraphicsTextItem, QStyle
 
 from pySimBlocks.gui.models.visual_group import BoundaryPort, VisualGroup
 
@@ -25,11 +25,18 @@ class GroupBoundaryPortItem(QGraphicsItem):
     L = 15
     H = 10
 
+    MARGIN = 4
+
     def __init__(self, boundary: BoundaryPort, parent_group: "GroupItem"):
         super().__init__(parent_group)
         self.boundary = boundary
         self.parent_group = parent_group
         self.setAcceptedMouseButtons(Qt.LeftButton)
+        t = parent_group.view.theme
+        self.label = QGraphicsTextItem(self)
+        self.label.setDefaultTextColor(t.text)
+        self.label.setFont(QFont("Sans Serif", 8))
+        self.update_port_label()
 
     @property
     def is_input(self) -> bool:
@@ -42,8 +49,39 @@ class GroupBoundaryPortItem(QGraphicsItem):
             local = QPointF(self.L, 0)
         return self.mapToScene(local)
 
+    def update_port_label(self) -> None:
+        """Refresh the external port label shown next to the boundary port."""
+        controller = self.parent_group.view.project_controller
+        text = ""
+        if controller is not None:
+            text = controller.boundary_port_flow_label(
+                self.parent_group.group,
+                self.boundary,
+            )
+        self.label.setPlainText(text)
+        self.label.setVisible(bool(text))
+        self._layout_port_label()
+
+    def _layout_port_label(self) -> None:
+        label_rect = self.label.boundingRect()
+        if self.is_input:
+            self.label.setPos(
+                self.R + self.MARGIN,
+                -label_rect.height() / 2,
+            )
+        else:
+            self.label.setPos(
+                -label_rect.width() - self.R - self.MARGIN,
+                -label_rect.height() / 2,
+            )
+
     def boundingRect(self) -> QRectF:
         return QRectF(-10, -10, 20, 20)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemScenePositionHasChanged:
+            self._layout_port_label()
+        return super().itemChange(change, value)
 
     def paint(self, painter, option, widget=None):
         t = self.parent_group.view.theme
@@ -114,13 +152,20 @@ class GroupItem(QGraphicsRectItem):
             item = GroupBoundaryPortItem(boundary, self)
             y = rect.height() * (index + 1) / (len(inputs) + 1)
             item.setPos(0, y)
+            item.update_port_label()
             self.boundary_port_items[boundary.uid] = item
 
         for index, boundary in enumerate(outputs):
             item = GroupBoundaryPortItem(boundary, self)
             y = rect.height() * (index + 1) / (len(outputs) + 1)
             item.setPos(rect.width(), y)
+            item.update_port_label()
             self.boundary_port_items[boundary.uid] = item
+
+    def refresh_boundary_port_labels(self) -> None:
+        """Update external port labels after diagram connections change."""
+        for item in self.boundary_port_items.values():
+            item.update_port_label()
 
     def get_boundary_anchor(self, boundary_uid: str) -> QPointF | None:
         port_item = self.boundary_port_items.get(boundary_uid)
