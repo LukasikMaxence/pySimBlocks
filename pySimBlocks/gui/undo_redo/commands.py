@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -128,7 +129,7 @@ class RemoveBlockCommand(QUndoCommand):
             for connection in controller.project_state.get_connections_of_block(block_instance)
         ]
         self._logging_before = list(controller.project_state.logging)
-        self._plots_before = [dict(title=p["title"], signals=list(p["signals"])) for p in controller.project_state.plots]
+        self._plots_before = copy.deepcopy(controller.project_state.plots)
 
     def redo(self) -> None:
         self._controller._remove_block(self._block_instance)
@@ -139,7 +140,7 @@ class RemoveBlockCommand(QUndoCommand):
         for snapshot in self._connections:
             self._controller._add_connection_from_snapshot(snapshot)
         self._controller.project_state.logging = list(self._logging_before)
-        self._controller.project_state.plots = [dict(title=p["title"], signals=list(p["signals"])) for p in self._plots_before]
+        self._controller.project_state.plots = copy.deepcopy(self._plots_before)
         self._controller.make_dirty()
 
 
@@ -393,4 +394,35 @@ class RenameGroupCommand(QUndoCommand):
         group.name = self._old_name
         self._controller.view.refresh_visual_groups()
         self._controller.view.view_stack_changed.emit()
+        self._controller.make_dirty()
+
+
+class WireManualBoundaryCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        group_uid: str,
+        boundary_uid: str,
+        before: tuple,
+        after: tuple,
+    ):
+        super().__init__("Wire Group Port")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._boundary_uid = boundary_uid
+        self._before = before
+        self._after = after
+
+    def redo(self) -> None:
+        wiring, connection = self._after
+        self._controller._apply_boundary_wire_snapshot(
+            self._group_uid, self._boundary_uid, wiring, connection
+        )
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        wiring, connection = self._before
+        self._controller._apply_boundary_wire_snapshot(
+            self._group_uid, self._boundary_uid, wiring, connection
+        )
         self._controller.make_dirty()

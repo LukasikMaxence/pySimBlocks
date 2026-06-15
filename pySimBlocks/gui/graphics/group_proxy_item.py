@@ -39,6 +39,24 @@ class GroupProxyPortItem(QGraphicsItem):
     def boundingRect(self) -> QRectF:
         return QRectF(-12, -12, 24, 24)
 
+    def shape(self):
+        path = QPainterPath()
+        if self.is_output:
+            path.moveTo(0, -self.H)
+            path.lineTo(0, self.H)
+            path.lineTo(self.L, 0)
+            path.closeSubpath()
+        else:
+            path.addEllipse(-self.R, -self.R, 2 * self.R, 2 * self.R)
+        return path
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.parent_proxy.view.create_connection_event(self)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def paint(self, painter, option, widget=None):
         t = self.parent_proxy.view.theme
         painter.setRenderHint(QPainter.Antialiasing)

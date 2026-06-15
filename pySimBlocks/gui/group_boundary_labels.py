@@ -5,8 +5,7 @@
 
 from __future__ import annotations
 
-from pySimBlocks.gui.models.connection_instance import ConnectionInstance
-from pySimBlocks.gui.models.project_state import ProjectState
+from pySimBlocks.gui.services.group_boundary_service import find_port
 from pySimBlocks.gui.models.visual_group import BoundaryPort, VisualGroup
 
 
@@ -24,6 +23,11 @@ def boundary_port_label(
     Input boundaries show the external source port (where the signal comes from).
     Output boundaries show the external destination port (where the signal goes).
     """
+    if boundary.origin == "manual" and not boundary.linked_connection_uid:
+        external = find_port(state, boundary.external_port_uid)
+        if external is not None:
+            return _port_display(external)
+
     linked = boundary.linked_port_uid
     if not linked or ":" not in linked:
         return ""

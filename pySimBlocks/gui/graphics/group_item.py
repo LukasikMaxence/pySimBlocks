@@ -83,6 +83,24 @@ class GroupBoundaryPortItem(QGraphicsItem):
             self._layout_port_label()
         return super().itemChange(change, value)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.parent_group.view.create_connection_event(self)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def shape(self):
+        path = QPainterPath()
+        if self.is_input:
+            path.addEllipse(-self.R, -self.R, 2 * self.R, 2 * self.R)
+        else:
+            path.moveTo(0, -self.H)
+            path.lineTo(0, self.H)
+            path.lineTo(self.L, 0)
+            path.closeSubpath()
+        return path
+
     def paint(self, painter, option, widget=None):
         t = self.parent_group.view.theme
         painter.setRenderHint(QPainter.Antialiasing)

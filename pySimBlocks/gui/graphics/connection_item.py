@@ -26,6 +26,19 @@ from pySimBlocks.gui.graphics.port_item import PortItem
 from pySimBlocks.gui.models.connection_instance import ConnectionInstance
 
 
+def _endpoint_view(endpoint):
+    if isinstance(endpoint, PortItem):
+        return endpoint.parent_block.view
+    from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyPortItem
+    from pySimBlocks.gui.graphics.group_item import GroupBoundaryPortItem
+
+    if isinstance(endpoint, GroupProxyPortItem):
+        return endpoint.parent_proxy.view
+    if isinstance(endpoint, GroupBoundaryPortItem):
+        return endpoint.parent_group.view
+    raise TypeError(f"Unsupported wire endpoint: {type(endpoint)!r}")
+
+
 class OrthogonalRoute:
     """Store routed connection points and the segment being dragged.
 
@@ -100,17 +113,17 @@ class ConnectionItem(QGraphicsPathItem):
         if points and len(points) >= 2:
             self.apply_manual_route(points)
 
-        t = self._valid_port.parent_block.view.theme
+        t = _endpoint_view(self._valid_port)
 
 
         if self.is_temporary:
             self.setFlag(QGraphicsItem.ItemIsSelectable, False)
             self.setAcceptedMouseButtons(Qt.NoButton)
-            pen = QPen(t.wire, 3, Qt.DashLine)
+            pen = QPen(t.theme.wire, 3, Qt.DashLine)
         else:
             self.setFlag(QGraphicsItem.ItemIsSelectable, True)
             self.setAcceptedMouseButtons(Qt.LeftButton)
-            pen = QPen(t.wire, 3, Qt.SolidLine)
+            pen = QPen(t.theme.wire, 3, Qt.SolidLine)
 
         self.setPen(pen)
         self.setZValue(2)

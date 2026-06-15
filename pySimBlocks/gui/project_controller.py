@@ -35,6 +35,17 @@ from pySimBlocks.gui.models import (
     VisualGroup,
 )
 from pySimBlocks.gui.group_boundary_labels import boundary_port_label
+from pySimBlocks.gui.services.group_boundary_service import (
+    BoundaryWiringState,
+    apply_wiring_state,
+    can_complete,
+    capture_wiring_state,
+    connection_endpoints,
+    find_connection_for_boundary,
+    port_key,
+    validate_external_link,
+    validate_internal_link,
+)
 from pySimBlocks.gui.widgets.diagram_view import DiagramView
 from pySimBlocks.gui.blocks.block_meta import BlockMeta
 from pySimBlocks.gui.services.yaml_tools import cleanup_runtime_project_yaml
@@ -54,6 +65,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     RenameGroupCommand,
     ToggleOrientationCommand,
     UngroupCommand,
+    WireManualBoundaryCommand,
     ConnectionSnapshot,
 )
 
@@ -232,6 +244,182 @@ class ProjectController(QObject):
         if group_uid is None:
             return False
         return self.ungroup(group_uid)
+
+    def try_wire_boundary_endpoints(self, src, dst) -> bool:
+        """Wire a manual boundary from a proxy or group port to a block port."""
+        from pySimBlocks.gui.graphics.group_item import GroupBoundaryPortItem
+        from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyPortItem
+        from pySimBlocks.gui.graphics.port_item import PortItem
+
+        proxy_port = None
+        boundary_port = None
+        block_port_item = None
+        for endpoint in (src, dst):
+            if isinstance(endpoint, GroupProxyPortItem):
+                proxy_port = endpoint
+            elif isinstance(endpoint, GroupBoundaryPortItem):
+                boundary_port = endpoint
+            elif isinstance(endpoint, PortItem):
+                block_port_item = endpoint
+
+        if block_port_item is None:
+            return False
+
+        member_port = block_port_item.instance
+
+        if proxy_port is not None:
+            group_uid = self.view.current_view_group_uid
+            if group_uid is None:
+                return False
+            return self._wire_manual_boundary_internal(
+                group_uid,
+                proxy_port.parent_proxy.boundary.uid,
+                member_port,
+            )
+
+        if boundary_port is not None:
+            return self._wire_manual_boundary_external(
+                boundary_port.parent_group.group.uid,
+                boundary_port.boundary.uid,
+                member_port,
+            )
+        return False
+
+    def _wire_manual_boundary_internal(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        member_port: PortInstance,
+    ) -> bool:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None or not validate_internal_link(group, boundary, member_port):
+            return False
+        before = self._capture_boundary_wire_snapshot(group_uid, boundary_uid)
+        after_wiring = capture_wiring_state(boundary)
+        after_wiring.linked_port_uid = port_key(member_port)
+        connection_snapshot = self._connection_snapshot_for_wiring(
+            group, boundary, after_wiring
+        )
+        after = (after_wiring, connection_snapshot)
+        self.undo_manager.push(
+            WireManualBoundaryCommand(self, group_uid, boundary_uid, before, after)
+        )
+        return True
+
+    def _wire_manual_boundary_external(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        external_port: PortInstance,
+    ) -> bool:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None or not validate_external_link(group, boundary, external_port):
+            return False
+        before = self._capture_boundary_wire_snapshot(group_uid, boundary_uid)
+        after_wiring = capture_wiring_state(boundary)
+        after_wiring.external_port_uid = port_key(external_port)
+        connection_snapshot = self._connection_snapshot_for_wiring(
+            group, boundary, after_wiring
+        )
+        after = (after_wiring, connection_snapshot)
+        self.undo_manager.push(
+            WireManualBoundaryCommand(self, group_uid, boundary_uid, before, after)
+        )
+        return True
+
+    def _find_boundary_port(
+        self,
+        group: VisualGroup,
+        boundary_uid: str,
+    ) -> BoundaryPort | None:
+        return next(
+            (port for port in group.boundary_ports if port.uid == boundary_uid),
+            None,
+        )
+
+    def _capture_boundary_wire_snapshot(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+    ) -> tuple[BoundaryWiringState, ConnectionSnapshot | None]:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return BoundaryWiringState(), None
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None:
+            return BoundaryWiringState(), None
+        connection = find_connection_for_boundary(self.project_state, boundary)
+        snapshot = (
+            self._capture_connection_snapshot(connection)
+            if connection is not None
+            else None
+        )
+        return capture_wiring_state(boundary), snapshot
+
+    def _connection_snapshot_for_wiring(
+        self,
+        group: VisualGroup,
+        boundary: BoundaryPort,
+        wiring: BoundaryWiringState,
+    ) -> ConnectionSnapshot | None:
+        trial = BoundaryPort(
+            uid=boundary.uid,
+            direction=boundary.direction,
+            linked_port_uid=wiring.linked_port_uid,
+            external_port_uid=wiring.external_port_uid,
+            origin="manual",
+        )
+        if not can_complete(self.project_state, trial):
+            return None
+        endpoints = connection_endpoints(self.project_state, trial)
+        if endpoints is None:
+            return None
+        src_port, dst_port = endpoints
+        return ConnectionSnapshot(
+            src_block_uid=src_port.block.uid,
+            src_port_name=src_port.name,
+            dst_block_uid=dst_port.block.uid,
+            dst_port_name=dst_port.name,
+            points=None,
+        )
+
+    def _apply_boundary_wire_snapshot(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        wiring: BoundaryWiringState,
+        connection_snapshot: ConnectionSnapshot | None,
+    ) -> None:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None:
+            return
+
+        existing = find_connection_for_boundary(self.project_state, boundary)
+        if existing is not None:
+            self._remove_connection(existing, refresh_boundaries=False)
+
+        apply_wiring_state(boundary, wiring)
+        if boundary.origin == "manual" and wiring.linked_port_uid:
+            self._remove_auto_boundaries_for_member_port(
+                group, wiring.linked_port_uid, keep_uid=boundary_uid
+            )
+        if connection_snapshot is not None:
+            connection = self._add_connection_from_snapshot(connection_snapshot)
+            if connection is not None:
+                boundary.linked_connection_uid = self._connection_key(connection)
+        else:
+            boundary.linked_connection_uid = ""
+
+        self.view.refresh_visual_groups()
 
     def boundary_port_flow_label(
         self,
@@ -994,6 +1182,11 @@ class ProjectController(QObject):
         group = self.project_state.get_visual_group(group_uid)
         if group is None:
             return
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is not None:
+            connection = find_connection_for_boundary(self.project_state, boundary)
+            if connection is not None:
+                self._remove_connection(connection, refresh_boundaries=False)
         group.boundary_ports = [
             port for port in group.boundary_ports if port.uid != boundary_uid
         ]
@@ -1119,9 +1312,32 @@ class ProjectController(QObject):
             f"{connection.dst_block().uid}:{connection.dst_port.name}"
         )
 
+    def _remove_auto_boundaries_for_member_port(
+        self,
+        group: VisualGroup,
+        member_port_key: str,
+        *,
+        keep_uid: str | None = None,
+    ) -> None:
+        """Drop auto boundary ports superseded by a manual port on the same member."""
+        group.boundary_ports = [
+            port
+            for port in group.boundary_ports
+            if not (
+                port.origin == "auto"
+                and port.linked_port_uid == member_port_key
+                and port.uid != keep_uid
+            )
+        ]
+
     def _rebuild_group_boundary_ports(self, group: VisualGroup) -> None:
         """Recompute auto boundary ports, keeping manual ports and stable auto ids."""
         manual_ports = [port for port in group.boundary_ports if port.origin == "manual"]
+        manual_member_keys = {
+            port.linked_port_uid
+            for port in manual_ports
+            if port.linked_port_uid
+        }
         existing_auto = {
             port.linked_port_uid: port
             for port in group.boundary_ports
@@ -1130,6 +1346,8 @@ class ProjectController(QObject):
 
         rebuilt_auto: list[BoundaryPort] = []
         for port in self._build_group_boundary_ports(group.members):
+            if port.linked_port_uid in manual_member_keys:
+                continue
             previous = existing_auto.get(port.linked_port_uid)
             if previous is not None:
                 port.uid = previous.uid

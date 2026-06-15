@@ -11,6 +11,7 @@ class BoundaryPort:
     uid: str
     direction: str
     linked_port_uid: str = ""
+    external_port_uid: str = ""
     origin: str = "auto"
     linked_connection_uid: str = ""
     label: str = ""
@@ -23,6 +24,7 @@ class BoundaryPort:
             "uid": self.uid,
             "direction": self.direction,
             "linked_port_uid": self.linked_port_uid,
+            "external_port_uid": self.external_port_uid,
             "origin": self.origin,
             "linked_connection_uid": self.linked_connection_uid,
         }
@@ -41,6 +43,7 @@ class BoundaryPort:
             uid=str(data.get("uid", "")),
             direction=str(data.get("direction", "")),
             linked_port_uid=str(data.get("linked_port_uid", "")),
+            external_port_uid=str(data.get("external_port_uid", "")),
             origin=str(data.get("origin", "auto")),
             linked_connection_uid=str(data.get("linked_connection_uid", "")),
             label=str(data.get("label", "")),

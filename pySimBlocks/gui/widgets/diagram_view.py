@@ -27,14 +27,16 @@ from PySide6.QtGui import QGuiApplication, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QInputDialog, QMenu
 
 from pySimBlocks.gui.graphics.block_item import BlockItem
-from pySimBlocks.gui.graphics.group_item import GroupItem
-from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyItem
+from pySimBlocks.gui.graphics.group_item import GroupBoundaryPortItem, GroupItem
+from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyItem, GroupProxyPortItem
 from pySimBlocks.gui.graphics.connection_item import ConnectionItem, OrthogonalRoute
+from pySimBlocks.gui.graphics.manual_boundary_wire_item import ManualBoundaryWireItem
 from pySimBlocks.gui.graphics.port_item import PortItem
 from pySimBlocks.gui.graphics.theme import make_theme
 from pySimBlocks.gui.group_ports import GROUP_IN_TYPE, GROUP_OUT_TYPE, GROUP_PORTS_CATEGORY
 from pySimBlocks.gui.models.block_instance import BlockInstance
 from pySimBlocks.gui.models.connection_instance import ConnectionInstance
+from pySimBlocks.gui.services.group_boundary_service import find_port
 
 if TYPE_CHECKING:
     from pySimBlocks.gui.project_controller import ProjectController
@@ -70,7 +72,7 @@ class DiagramView(QGraphicsView):
             app.paletteChanged.connect(lambda *_: QTimer.singleShot(0, self._apply_theme_from_system))
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
 
-        self.pending_port: PortItem | None = None
+        self.pending_port: PortItem | GroupProxyPortItem | GroupBoundaryPortItem | None = None
         self.temp_connection: ConnectionItem | None = None
         self.copied_block: BlockItem | None = None
         self.drop_event_pos: QPointF = QPointF(0, 0)
@@ -78,6 +80,7 @@ class DiagramView(QGraphicsView):
         self.block_items: dict[str, BlockItem] = {}
         self.group_items: dict[str, GroupItem] = {}
         self.proxy_items: dict[str, GroupProxyItem] = {}
+        self.manual_boundary_wires: dict[str, ManualBoundaryWireItem] = {}
         self.connections: dict[ConnectionInstance, ConnectionItem] = {}
         self.view_stack: list[str] = []
 
@@ -307,6 +310,74 @@ class DiagramView(QGraphicsView):
 
         self._refresh_group_proxies(active_group)
         self._refresh_group_port_labels()
+        self.refresh_manual_boundary_wires()
+
+    def refresh_manual_boundary_wires(self) -> None:
+        """Rebuild visual-only wires for incomplete manual group boundaries."""
+        for wire in self.manual_boundary_wires.values():
+            self.diagram_scene.removeItem(wire)
+        self.manual_boundary_wires.clear()
+
+        if self.project_controller is None:
+            return
+
+        state = self.project_controller.project_state
+        active_uid = self.current_view_group_uid
+
+        if active_uid:
+            group = state.get_visual_group(active_uid)
+            if group is None:
+                return
+            for boundary in group.boundary_ports:
+                if boundary.origin != "manual" or boundary.linked_connection_uid:
+                    continue
+                if not boundary.linked_port_uid:
+                    continue
+                proxy = self.proxy_items.get(boundary.uid)
+                member_port = find_port(state, boundary.linked_port_uid)
+                if proxy is None or member_port is None:
+                    continue
+                block_item = self.get_block_item_from_instance(member_port.block)
+                if block_item is None:
+                    continue
+                port_item = block_item.get_port_item(member_port.name)
+                if port_item is None:
+                    continue
+                wire = ManualBoundaryWireItem(
+                    self,
+                    proxy.member_anchor,
+                    port_item.connection_anchor,
+                )
+                self.diagram_scene.addItem(wire)
+                self.manual_boundary_wires[f"{boundary.uid}:internal"] = wire
+            return
+
+        for group in state.visual_groups:
+            group_item = self.group_items.get(group.uid)
+            if group_item is None:
+                continue
+            for boundary in group.boundary_ports:
+                if boundary.origin != "manual" or boundary.linked_connection_uid:
+                    continue
+                if not boundary.external_port_uid:
+                    continue
+                boundary_item = group_item.boundary_port_items.get(boundary.uid)
+                external_port = find_port(state, boundary.external_port_uid)
+                if boundary_item is None or external_port is None:
+                    continue
+                block_item = self.get_block_item_from_instance(external_port.block)
+                if block_item is None:
+                    continue
+                port_item = block_item.get_port_item(external_port.name)
+                if port_item is None:
+                    continue
+                wire = ManualBoundaryWireItem(
+                    self,
+                    boundary_item.connection_anchor,
+                    port_item.connection_anchor,
+                )
+                self.diagram_scene.addItem(wire)
+                self.manual_boundary_wires[f"{boundary.uid}:external"] = wire
 
     def _refresh_group_port_labels(self) -> None:
         """Refresh boundary and proxy labels after connection changes."""
@@ -354,6 +425,9 @@ class DiagramView(QGraphicsView):
         if active_uid and self.project_controller is not None:
             group = self.project_controller.project_state.get_visual_group(active_uid)
             if group is not None:
+                member_anchor = self._manual_proxy_anchor_for_member_port(group, port_item)
+                if member_anchor is not None:
+                    return member_anchor
                 external_anchor = self._proxy_anchor_for_external_port(group, port_item)
                 if external_anchor is not None:
                     return external_anchor
@@ -370,6 +444,20 @@ class DiagramView(QGraphicsView):
                 return anchor
 
         return port_item.connection_anchor()
+
+    def _manual_proxy_anchor_for_member_port(self, group, port_item: PortItem) -> QPointF | None:
+        """Route member ports to a manual proxy while the boundary is incomplete."""
+        key = f"{port_item.instance.block.uid}:{port_item.instance.name}"
+        for boundary in group.boundary_ports:
+            if boundary.origin != "manual" or boundary.linked_connection_uid:
+                continue
+            if boundary.linked_port_uid != key:
+                continue
+            proxy = self.proxy_items.get(boundary.uid)
+            if proxy is None:
+                return None
+            return proxy.member_anchor()
+        return None
 
     def _proxy_anchor_for_external_port(self, group, port_item: PortItem) -> QPointF | None:
         """In internal view, attach crossing wires to the member-facing proxy port."""
@@ -413,6 +501,8 @@ class DiagramView(QGraphicsView):
         """Refresh wires after a group proxy is moved."""
         for conn_item in self.connections.values():
             conn_item.update_position()
+        for wire in self.manual_boundary_wires.values():
+            wire.update_position()
 
     def on_connection_route_edited(
         self,
@@ -474,12 +564,11 @@ class DiagramView(QGraphicsView):
         """
         return self.block_items.get(block_instance.uid)
 
-    def create_connection_event(self, port: PortItem) -> None:
-        """Begin a wire-drag interaction from the given port item.
-
-        Args:
-            port: The port item from which the connection is being drawn.
-        """
+    def create_connection_event(
+        self,
+        port: PortItem | GroupProxyPortItem | GroupBoundaryPortItem,
+    ) -> None:
+        """Begin a wire-drag interaction from the given port item."""
         if not self.pending_port:
             self.pending_port = port
             self.temp_connection = ConnectionItem(self.pending_port, None, None)
@@ -515,6 +604,8 @@ class DiagramView(QGraphicsView):
         for conn_inst, conn_item in self.connections.items():
             if conn_inst.is_block_involved(block_item.instance):
                 conn_item.update_position()
+        for wire in self.manual_boundary_wires.values():
+            wire.update_position()
 
     def on_block_ports_refreshed(self, block_item: BlockItem) -> None:
         """Refresh all wire positions after the ports of a block have been updated.
@@ -691,12 +782,25 @@ class DiagramView(QGraphicsView):
 
         pos = self.mapToScene(event.position().toPoint())
         items = self.diagram_scene.items(pos)
-        port = next((i for i in items if isinstance(i, PortItem)), None)
-        if not port:
+        wire_types = (PortItem, GroupProxyPortItem, GroupBoundaryPortItem)
+        target = next((item for item in items if isinstance(item, wire_types)), None)
+        if target is None or target is self.pending_port:
             self._cancel_temp_connection()
             return
 
-        self.project_controller.add_connection(self.pending_port.instance, port.instance)
+        if not (
+            isinstance(self.pending_port, PortItem)
+            and isinstance(target, PortItem)
+        ):
+            if self.project_controller.try_wire_boundary_endpoints(
+                self.pending_port, target
+            ):
+                self._cancel_temp_connection()
+                return
+            self._cancel_temp_connection()
+            return
+
+        self.project_controller.add_connection(self.pending_port.instance, target.instance)
         self._cancel_temp_connection()
 
     def contextMenuEvent(self, event) -> None:
@@ -769,6 +873,9 @@ class DiagramView(QGraphicsView):
         self.block_items.clear()
         self.group_items.clear()
         self.proxy_items.clear()
+        for wire in self.manual_boundary_wires.values():
+            self.diagram_scene.removeItem(wire)
+        self.manual_boundary_wires.clear()
         self.connections.clear()
         self.view_stack = []
         self.temp_connection = None
