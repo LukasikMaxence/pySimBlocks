@@ -239,6 +239,58 @@ class UngroupCommand(QUndoCommand):
             self._controller.make_dirty()
 
 
+class AddToGroupCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        group_uid: str,
+        block_uid: str,
+        layout: dict[str, Any],
+    ):
+        super().__init__("Add to Group")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._block_uid = block_uid
+        self._layout = dict(layout)
+        group = controller.project_state.get_visual_group(group_uid)
+        self._snapshot_before = group.to_dict() if group is not None else None
+        self._snapshot_after: dict | None = None
+
+    def redo(self) -> None:
+        self._controller._add_member_to_group(
+            self._group_uid, self._block_uid, self._layout
+        )
+        group = self._controller.project_state.get_visual_group(self._group_uid)
+        if group is not None:
+            self._snapshot_after = group.to_dict()
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._apply_group_snapshot(self._snapshot_before, self._group_uid)
+        self._controller.make_dirty()
+
+
+class RemoveFromGroupCommand(QUndoCommand):
+    def __init__(self, controller, group_uid: str, block_uid: str):
+        super().__init__("Remove from Group")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._block_uid = block_uid
+        group = controller.project_state.get_visual_group(group_uid)
+        self._snapshot_before = group.to_dict() if group is not None else None
+        self._snapshot_after: dict | None = None
+
+    def redo(self) -> None:
+        self._controller._remove_member_from_group(self._group_uid, self._block_uid)
+        group = self._controller.project_state.get_visual_group(self._group_uid)
+        self._snapshot_after = group.to_dict() if group is not None else None
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._apply_group_snapshot(self._snapshot_before, self._group_uid)
+        self._controller.make_dirty()
+
+
 class MoveResizeGroupCommand(QUndoCommand):
     def __init__(
         self,

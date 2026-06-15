@@ -54,6 +54,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     AddBlockCommand,
     AddConnectionCommand,
     AddManualBoundaryCommand,
+    AddToGroupCommand,
     EditBlockParamsCommand,
     EditConnectionRouteCommand,
     GroupBlocksCommand,
@@ -62,6 +63,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     MoveResizeGroupCommand,
     RemoveBlockCommand,
     RemoveConnectionCommand,
+    RemoveFromGroupCommand,
     RenameGroupCommand,
     ToggleOrientationCommand,
     UngroupCommand,
@@ -244,6 +246,49 @@ class ProjectController(QObject):
         if group_uid is None:
             return False
         return self.ungroup(group_uid)
+
+    def add_block_to_group(
+        self,
+        group_uid: str,
+        block_instance: BlockInstance,
+        layout: dict[str, Any] | None = None,
+    ) -> bool:
+        """Add an existing block to a visual group (undoable)."""
+        if not self._can_add_block_to_group(group_uid, block_instance.uid):
+            return False
+        if layout is None:
+            layout = self._capture_block_layout(block_instance)
+        self.undo_manager.push(
+            AddToGroupCommand(self, group_uid, block_instance.uid, layout)
+        )
+        return True
+
+    def add_block_in_group_view(
+        self,
+        category: str,
+        block_type: str,
+        group_uid: str,
+    ) -> BlockInstance | None:
+        """Drop a new palette block into a group's internal view (undoable)."""
+        if self.project_state.get_visual_group(group_uid) is None:
+            return None
+        self.begin_macro("Add to Group")
+        try:
+            block = self.add_block(category, block_type)
+            layout = self._capture_block_layout(block)
+            if not self.add_block_to_group(group_uid, block, layout):
+                return None
+            return block
+        finally:
+            self.end_macro()
+
+    def remove_block_from_group(self, group_uid: str, block_uid: str) -> bool:
+        """Remove a block from a visual group without deleting it (undoable)."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None or block_uid not in group.members:
+            return False
+        self.undo_manager.push(RemoveFromGroupCommand(self, group_uid, block_uid))
+        return True
 
     def try_wire_boundary_endpoints(self, src, dst) -> bool:
         """Wire a manual boundary from a proxy or group port to a block port."""
@@ -1044,6 +1089,97 @@ class ProjectController(QObject):
     def _remove_visual_group(self, group_uid: str) -> bool:
         """Remove a visual group without pushing undo."""
         return self.project_state.remove_visual_group(group_uid)
+
+    def _group_containing_member(self, block_uid: str) -> VisualGroup | None:
+        """Return the visual group that lists ``block_uid`` as a member."""
+        for group in self.project_state.visual_groups:
+            if block_uid in group.members:
+                return group
+        return None
+
+    def _can_add_block_to_group(self, group_uid: str, block_uid: str) -> bool:
+        if self._find_block_by_uid(block_uid) is None:
+            return False
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None or block_uid in group.members:
+            return False
+        owner = self._group_containing_member(block_uid)
+        return owner is None or owner.uid == group_uid
+
+    def _apply_group_snapshot(self, snapshot: dict | None, group_uid: str) -> None:
+        """Restore a visual group from a serialized snapshot."""
+        if snapshot is None:
+            if group_uid in self.view.view_stack:
+                self.view.navigate_out_of_group(group_uid)
+            self._remove_visual_group(group_uid)
+        else:
+            group = VisualGroup.from_dict(snapshot)
+            replaced = False
+            for index, existing in enumerate(self.project_state.visual_groups):
+                if existing.uid == group.uid:
+                    self.project_state.visual_groups[index] = group
+                    replaced = True
+                    break
+            if not replaced:
+                self.project_state.visual_groups.append(group)
+            self.ensure_group_boundary_proxies(group)
+        self.view.refresh_visual_groups()
+
+    def _add_member_to_group(
+        self,
+        group_uid: str,
+        block_uid: str,
+        layout: dict[str, Any],
+    ) -> bool:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None or not self._can_add_block_to_group(group_uid, block_uid):
+            return False
+
+        group.members.append(block_uid)
+        group.member_layouts[block_uid] = dict(layout)
+        self._rebuild_group_boundary_ports(group)
+        self.view.refresh_visual_groups()
+        return True
+
+    def _remove_boundaries_for_member(self, group: VisualGroup, block_uid: str) -> None:
+        """Remove boundary ports tied to a member block."""
+        prefix = f"{block_uid}:"
+        for boundary in list(group.boundary_ports):
+            if not boundary.linked_port_uid.startswith(prefix):
+                continue
+            connection = find_connection_for_boundary(self.project_state, boundary)
+            if connection is not None:
+                self._remove_connection(connection, refresh_boundaries=False)
+        group.boundary_ports = [
+            port
+            for port in group.boundary_ports
+            if not port.linked_port_uid.startswith(prefix)
+        ]
+
+    def _remove_member_from_group(self, group_uid: str, block_uid: str) -> bool:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None or block_uid not in group.members:
+            return False
+
+        layout = dict(group.member_layouts.get(block_uid, {}))
+        self._remove_boundaries_for_member(group, block_uid)
+        group.members = [uid for uid in group.members if uid != block_uid]
+        group.member_layouts.pop(block_uid, None)
+
+        if not group.members:
+            if group_uid in self.view.view_stack:
+                self.view.navigate_out_of_group(group_uid)
+            self._remove_visual_group(group_uid)
+        else:
+            self._rebuild_group_boundary_ports(group)
+            block = self._find_block_by_uid(block_uid)
+            if block is not None and layout:
+                item = self.view.get_block_item_from_instance(block)
+                if item is not None:
+                    self._apply_block_layout(item, layout)
+
+        self.view.refresh_visual_groups()
+        return True
 
     def _capture_member_layouts(self, member_uids: list[str]) -> dict[str, dict[str, Any]]:
         """Snapshot block item geometry for internal group view."""

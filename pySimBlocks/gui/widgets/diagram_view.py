@@ -172,6 +172,32 @@ class DiagramView(QGraphicsView):
                 return item.group.uid
         return None
 
+    def group_item_for_block_drop(self, block_item: BlockItem) -> GroupItem | None:
+        """Return the group under a block's center, for drag-and-drop membership."""
+        if self.project_controller is None or self.current_view_group_uid is not None:
+            return None
+        center = block_item.sceneBoundingRect().center()
+        for group_item in self.group_items.values():
+            if not group_item.isVisible():
+                continue
+            if group_item.sceneBoundingRect().contains(center):
+                return group_item
+        return None
+
+    def try_drop_block_onto_group(self, block_item: BlockItem) -> bool:
+        """Add a root-level block to the group it was dropped onto."""
+        if self.project_controller is None:
+            return False
+        target_group = self.group_item_for_block_drop(block_item)
+        if target_group is None:
+            return False
+        layout = self.project_controller._capture_block_layout(block_item.instance)
+        return self.project_controller.add_block_to_group(
+            target_group.group.uid,
+            block_item.instance,
+            layout,
+        )
+
     @property
     def current_view_group_uid(self) -> str | None:
         """UID of the innermost group in the current view stack."""
@@ -652,7 +678,13 @@ class DiagramView(QGraphicsView):
                 self.drop_event_pos,
             )
         else:
-            self.project_controller.add_block(category, block_type)
+            group_uid = self.current_view_group_uid
+            if group_uid is not None and self.project_controller is not None:
+                self.project_controller.add_block_in_group_view(
+                    category, block_type, group_uid
+                )
+            else:
+                self.project_controller.add_block(category, block_type)
         event.acceptProposedAction()
 
     def keyPressEvent(self, event) -> None:
@@ -813,6 +845,7 @@ class DiagramView(QGraphicsView):
         selected_blocks = self.get_selected_block_instances()
         selected_group_uid = self.get_selected_group_uid()
         clicked_group = self._group_item_at(event)
+        clicked_block = self._block_item_at(event)
         target_group_uid = (
             clicked_group.group.uid if clicked_group is not None else selected_group_uid
         )
@@ -822,6 +855,24 @@ class DiagramView(QGraphicsView):
         group_action.triggered.connect(
             lambda *_args: self.project_controller.group_selected_blocks()
         )
+
+        if (
+            self.current_view_group_uid is None
+            and target_group_uid is not None
+            and len(selected_blocks) == 1
+        ):
+            block = selected_blocks[0]
+            add_to_group = menu.addAction("Add to group")
+            add_to_group.setEnabled(
+                self.project_controller._can_add_block_to_group(
+                    target_group_uid, block.uid
+                )
+            )
+            add_to_group.triggered.connect(
+                lambda *_args, uid=target_group_uid, inst=block: (
+                    self.project_controller.add_block_to_group(uid, inst)
+                )
+            )
 
         if target_group_uid is not None:
             enter_action = menu.addAction("Enter")
@@ -847,6 +898,13 @@ class DiagramView(QGraphicsView):
             add_in.triggered.connect(self._add_manual_group_input)
             add_out = menu.addAction("Add output")
             add_out.triggered.connect(self._add_manual_group_output)
+            if clicked_block is not None:
+                remove_from_group = menu.addAction("Remove from group")
+                remove_from_group.triggered.connect(
+                    lambda *_args, uid=self.current_view_group_uid, block=clicked_block.instance: (
+                        self.project_controller.remove_block_from_group(uid, block.uid)
+                    )
+                )
 
         menu.exec(event.globalPos())
 
@@ -954,6 +1012,17 @@ class DiagramView(QGraphicsView):
         pos = self.mapToScene(view_pos)
         for item in self.diagram_scene.items(pos):
             if isinstance(item, GroupItem):
+                return item
+        return None
+
+    def _block_item_at(self, event) -> BlockItem | None:
+        if hasattr(event, "position"):
+            view_pos = event.position().toPoint()
+        else:
+            view_pos = event.pos()
+        pos = self.mapToScene(view_pos)
+        for item in self.diagram_scene.items(pos):
+            if isinstance(item, BlockItem):
                 return item
         return None
 
