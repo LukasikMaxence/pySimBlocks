@@ -123,15 +123,11 @@ class GroupProxyItem(QGraphicsRectItem):
         return "In" if self.is_group_in else "Out"
 
     def center_label(self) -> str:
-        """External flow label (source for In, destination for Out), or In/Out."""
+        """Return proxy label from member port or manual override."""
         controller = self.view.project_controller
-        group_uid = self.view.current_view_group_uid
-        if controller is None or group_uid is None:
+        if controller is None:
             return self.kind_label
-        group = controller.project_state.get_visual_group(group_uid)
-        if group is None:
-            return self.kind_label
-        text = controller.boundary_port_flow_label(group, self.boundary)
+        text = controller.boundary_proxy_label(self.boundary)
         return text if text else self.kind_label
 
     def member_anchor(self) -> QPointF:
@@ -187,6 +183,18 @@ class GroupProxyItem(QGraphicsRectItem):
                 start_pos,
                 end_pos,
             )
+
+    def contextMenuEvent(self, event):
+        if self.view is not None:
+            global_pos = (
+                event.screenPos()
+                if hasattr(event, "screenPos")
+                else event.globalPos()
+            )
+            self.view._show_boundary_port_context_menu(self, global_pos)
+            event.accept()
+            return
+        super().contextMenuEvent(event)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionChange and self.scene():

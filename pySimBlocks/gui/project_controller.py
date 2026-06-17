@@ -34,6 +34,12 @@ from pySimBlocks.gui.models import (
     ProjectState,
     VisualGroup,
 )
+from pySimBlocks.gui.diagram_clipboard import (
+    DiagramClipboard,
+    capture_selection_clipboard,
+    paste_clipboard,
+    undo_paste,
+)
 from pySimBlocks.gui.group_boundary_labels import boundary_port_label
 from pySimBlocks.gui.services.group_boundary_service import (
     BoundaryWiringState,
@@ -42,6 +48,7 @@ from pySimBlocks.gui.services.group_boundary_service import (
     capture_wiring_state,
     connection_endpoints,
     find_connection_for_boundary,
+    find_port,
     port_key,
     validate_external_link,
     validate_internal_link,
@@ -64,7 +71,9 @@ from pySimBlocks.gui.undo_redo.commands import (
     RemoveBlockCommand,
     RemoveConnectionCommand,
     RemoveFromGroupCommand,
+    RenameBoundaryPortCommand,
     RenameGroupCommand,
+    PasteClipboardCommand,
     ToggleOrientationCommand,
     UngroupCommand,
     WireManualBoundaryCommand,
@@ -151,9 +160,30 @@ class ProjectController(QObject):
         Returns:
             The newly created copy as a :class:`BlockInstance`.
         """
-        copy = BlockInstance.copy(block_instance)
-        self.undo_manager.push(AddBlockCommand(self, copy))
-        return copy
+        copy_block = BlockInstance.copy(block_instance)
+        self.undo_manager.push(AddBlockCommand(self, copy_block))
+        return copy_block
+
+    def copy_selection(self) -> bool:
+        """Copy the current diagram selection to the view clipboard."""
+        clipboard = capture_selection_clipboard(self)
+        if clipboard is None:
+            return False
+        self.view.clipboard = clipboard
+        self.view.paste_generation = 0
+        return True
+
+    def paste_clipboard_at(self, origin: QPointF) -> bool:
+        """Paste the view clipboard at ``origin`` (undoable)."""
+        clipboard = self.view.clipboard
+        if clipboard is None or not clipboard.blocks:
+            return False
+        parent_uid = self.view.current_view_group_uid
+        self.undo_manager.push(
+            PasteClipboardCommand(self, clipboard, QPointF(origin), parent_uid)
+        )
+        self.view.paste_generation += 1
+        return True
 
     def rename_block(self, block_instance: BlockInstance, new_name: str) -> None:
         """Rename a block and update all references in logging and plot signals.
@@ -473,6 +503,42 @@ class ProjectController(QObject):
     ) -> str:
         """Return the flow label for a boundary (source for In, destination for Out)."""
         return boundary_port_label(self.project_state, group, boundary)
+
+    def boundary_proxy_label(self, boundary: BoundaryPort) -> str:
+        """Return proxy label: manual override, else linked internal port."""
+        if boundary.label.strip():
+            return boundary.label.strip()
+        linked = find_port(self.project_state, boundary.linked_port_uid)
+        if linked is None:
+            return ""
+        return str(linked.display_as or linked.name)
+
+    def rename_boundary_port(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        new_label: str,
+    ) -> bool:
+        """Rename one proxy label (empty string resets automatic label)."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None:
+            return False
+        trimmed = new_label.strip()
+        if trimmed == boundary.label:
+            return False
+        self.undo_manager.push(
+            RenameBoundaryPortCommand(
+                self,
+                group_uid,
+                boundary_uid,
+                boundary.label,
+                trimmed,
+            )
+        )
+        return True
 
     def rename_visual_group(self, group_uid: str, new_name: str) -> bool:
         """Rename a visual group (undoable)."""
@@ -842,7 +908,11 @@ class ProjectController(QObject):
         block_instance.name = self.make_unique_name(block_instance.name)
         block_instance.resolve_ports()
         self.project_state.add_block(block_instance)
-        self.view.add_block(block_instance, block_layout)
+        layout = dict(block_layout or {})
+        self.view.add_block(block_instance, layout)
+        block_item = self.view.get_block_item_from_instance(block_instance)
+        if block_item is not None and ("x" in layout or "y" in layout):
+            self._apply_block_layout(block_item, layout)
         self.view.refresh_visual_groups()
 
         return block_instance
@@ -1352,6 +1422,16 @@ class ProjectController(QObject):
             proxy_item.setPos(QPointF(pos))
         for conn_item in self.view.connections.values():
             conn_item.update_position()
+
+    def _set_boundary_label(self, group_uid: str, boundary_uid: str, label: str) -> None:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None:
+            return
+        boundary.label = label.strip()
+        self.view.refresh_visual_groups()
 
     def add_manual_boundary_port(
         self,

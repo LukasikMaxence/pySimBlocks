@@ -449,6 +449,35 @@ class RenameGroupCommand(QUndoCommand):
         self._controller.make_dirty()
 
 
+class RenameBoundaryPortCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        group_uid: str,
+        boundary_uid: str,
+        old_label: str,
+        new_label: str,
+    ):
+        super().__init__("Rename Group Port")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._boundary_uid = boundary_uid
+        self._old_label = old_label
+        self._new_label = new_label
+
+    def redo(self) -> None:
+        self._controller._set_boundary_label(
+            self._group_uid, self._boundary_uid, self._new_label
+        )
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._set_boundary_label(
+            self._group_uid, self._boundary_uid, self._old_label
+        )
+        self._controller.make_dirty()
+
+
 class WireManualBoundaryCommand(QUndoCommand):
     def __init__(
         self,
@@ -478,3 +507,37 @@ class WireManualBoundaryCommand(QUndoCommand):
             self._group_uid, self._boundary_uid, wiring, connection
         )
         self._controller.make_dirty()
+
+
+class PasteClipboardCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        clipboard,
+        origin: QPointF,
+        parent_group_uid: str | None = None,
+    ):
+        super().__init__("Paste")
+        self._controller = controller
+        self._clipboard = clipboard
+        self._origin = QPointF(origin)
+        self._parent_group_uid = parent_group_uid
+        self._result = None
+
+    def redo(self) -> None:
+        from pySimBlocks.gui.diagram_clipboard import paste_clipboard
+
+        self._result = paste_clipboard(
+            self._controller,
+            self._clipboard,
+            self._origin,
+            parent_group_uid=self._parent_group_uid,
+        )
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        from pySimBlocks.gui.diagram_clipboard import undo_paste
+
+        if self._result is not None:
+            undo_paste(self._controller, self._result)
+            self._controller.make_dirty()

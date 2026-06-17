@@ -28,6 +28,7 @@ from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QInputDialog, QMenu
 
 from pySimBlocks.gui.graphics.block_item import BlockItem
 from pySimBlocks.gui.graphics.group_item import GroupBoundaryPortItem, GroupItem
+from pySimBlocks.gui.diagram_clipboard import DiagramClipboard
 from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyItem, GroupProxyPortItem
 from pySimBlocks.gui.graphics.connection_item import ConnectionItem, OrthogonalRoute
 from pySimBlocks.gui.graphics.manual_boundary_wire_item import ManualBoundaryWireItem
@@ -74,7 +75,8 @@ class DiagramView(QGraphicsView):
 
         self.pending_port: PortItem | GroupProxyPortItem | GroupBoundaryPortItem | None = None
         self.temp_connection: ConnectionItem | None = None
-        self.copied_block: BlockItem | None = None
+        self.clipboard: DiagramClipboard | None = None
+        self.paste_generation = 0
         self.drop_event_pos: QPointF = QPointF(0, 0)
         self.project_controller: ProjectController | None
         self.block_items: dict[str, BlockItem] = {}
@@ -712,16 +714,20 @@ class DiagramView(QGraphicsView):
 
         # COPY
         if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
-            selected = [i for i in self.diagram_scene.selectedItems() if isinstance(i, BlockItem)]
-            if selected:
-                self.copied_block = selected[0]
+            if self.project_controller.copy_selection():
+                event.accept()
             return
 
         # PASTE
         if event.key() == Qt.Key_V and event.modifiers() & Qt.ControlModifier:
-            if self.copied_block:
-                self.drop_event_pos = self.copied_block.pos() + QPointF(30, 30)
-                self.project_controller.add_copy_block(self.copied_block.instance)
+            if self.clipboard and self.clipboard.blocks:
+                offset = 30 * (self.paste_generation + 1)
+                origin = QPointF(
+                    self.clipboard.anchor_x + offset,
+                    self.clipboard.anchor_y + offset,
+                )
+                if self.project_controller.paste_clipboard_at(origin):
+                    event.accept()
             return
 
         # DELETE
@@ -839,6 +845,11 @@ class DiagramView(QGraphicsView):
         """Show diagram context menu for grouping actions."""
         if self.project_controller is None:
             super().contextMenuEvent(event)
+            return
+
+        clicked_proxy = self._proxy_item_at(event)
+        if clicked_proxy is not None:
+            self._show_boundary_port_context_menu(clicked_proxy, event.globalPos())
             return
 
         menu = QMenu(self)
@@ -1025,6 +1036,52 @@ class DiagramView(QGraphicsView):
             if isinstance(item, BlockItem):
                 return item
         return None
+
+    def _proxy_item_at(self, event) -> GroupProxyItem | None:
+        if hasattr(event, "position"):
+            view_pos = event.position().toPoint()
+        else:
+            view_pos = event.pos()
+        pos = self.mapToScene(view_pos)
+        for item in self.diagram_scene.items(pos):
+            current = item
+            while current is not None:
+                if isinstance(current, GroupProxyItem):
+                    return current
+                current = current.parentItem()
+        return None
+
+    def _show_boundary_port_context_menu(
+        self,
+        proxy_item: GroupProxyItem,
+        global_pos,
+    ) -> None:
+        """Show rename/reset menu for a group In/Out proxy."""
+        if self.project_controller is None or self.current_view_group_uid is None:
+            return
+
+        boundary = proxy_item.boundary
+        group_uid = self.current_view_group_uid
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename port")
+        reset_action = menu.addAction("Reset automatic name")
+        reset_action.setEnabled(bool(boundary.label.strip()))
+
+        action = menu.exec(global_pos)
+        if action is rename_action:
+            current = boundary.label if boundary.label.strip() else proxy_item.center_label()
+            text, ok = QInputDialog.getText(
+                self,
+                "Rename Group Port",
+                "Proxy label:",
+                text=current,
+            )
+            if ok:
+                self.project_controller.rename_boundary_port(
+                    group_uid, boundary.uid, text
+                )
+        elif action is reset_action:
+            self.project_controller.rename_boundary_port(group_uid, boundary.uid, "")
 
     def _rename_group(self, group_uid: str) -> None:
         if self.project_controller is None:
