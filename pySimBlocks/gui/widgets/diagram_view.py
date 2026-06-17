@@ -926,7 +926,14 @@ class DiagramView(QGraphicsView):
             return
         self.project_controller.begin_macro("Delete Selection")
         try:
+            removed_boundaries: set[tuple[str, str]] = set()
             for item in selected_items:
+                boundary_key = self._boundary_key_for_item(item)
+                if boundary_key is not None:
+                    if boundary_key not in removed_boundaries:
+                        removed_boundaries.add(boundary_key)
+                        self.project_controller.remove_boundary_port(*boundary_key)
+                    continue
                 if isinstance(item, GroupItem):
                     self.project_controller.ungroup(item.group.uid)
                 elif isinstance(item, BlockItem):
@@ -935,6 +942,18 @@ class DiagramView(QGraphicsView):
                     self.project_controller.remove_connection(item.instance)
         finally:
             self.project_controller.end_macro()
+
+    def _boundary_key_for_item(self, item) -> tuple[str, str] | None:
+        """Return (group_uid, boundary_uid) for a selected group boundary item."""
+        if isinstance(item, GroupProxyPortItem):
+            item = item.parent_proxy
+        if isinstance(item, GroupProxyItem):
+            if self.current_view_group_uid is None:
+                return None
+            return self.current_view_group_uid, item.boundary.uid
+        if isinstance(item, GroupBoundaryPortItem):
+            return item.parent_group.group.uid, item.boundary.uid
+        return None
 
     def clear_scene(self) -> None:
         """Remove all blocks and connections from the scene and reset state."""
@@ -1064,6 +1083,7 @@ class DiagramView(QGraphicsView):
         group_uid = self.current_view_group_uid
         menu = QMenu(self)
         rename_action = menu.addAction("Rename port")
+        delete_action = menu.addAction("Delete port")
         reset_action = menu.addAction("Reset automatic name")
         reset_action.setEnabled(bool(boundary.label.strip()))
 
@@ -1080,6 +1100,8 @@ class DiagramView(QGraphicsView):
                 self.project_controller.rename_boundary_port(
                     group_uid, boundary.uid, text
                 )
+        elif action is delete_action:
+            self.project_controller.remove_boundary_port(group_uid, boundary.uid)
         elif action is reset_action:
             self.project_controller.rename_boundary_port(group_uid, boundary.uid, "")
 

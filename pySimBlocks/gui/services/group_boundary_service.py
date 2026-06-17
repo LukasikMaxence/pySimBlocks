@@ -135,15 +135,27 @@ def can_complete(state: ProjectState, boundary: BoundaryPort) -> bool:
     return True
 
 
+def connection_key(connection: ConnectionInstance) -> str:
+    """Build a stable key for one diagram connection."""
+    return (
+        f"{connection.src_block().uid}:{connection.src_port.name}->"
+        f"{connection.dst_block().uid}:{connection.dst_port.name}"
+    )
+
+
 def find_connection_for_boundary(
     state: ProjectState,
     boundary: BoundaryPort,
 ) -> ConnectionInstance | None:
     endpoints = connection_endpoints(state, boundary)
-    if endpoints is None:
-        return None
-    src_port, dst_port = endpoints
-    for connection in state.connections:
-        if connection.src_port is src_port and connection.dst_port is dst_port:
-            return connection
+    if endpoints is not None:
+        src_port, dst_port = endpoints
+        for connection in state.connections:
+            if connection.src_port is src_port and connection.dst_port is dst_port:
+                return connection
+
+    if boundary.linked_connection_uid:
+        for connection in state.connections:
+            if connection_key(connection) == boundary.linked_connection_uid:
+                return connection
     return None

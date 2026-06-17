@@ -71,6 +71,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     RemoveBlockCommand,
     RemoveConnectionCommand,
     RemoveFromGroupCommand,
+    RemoveBoundaryPortCommand,
     RenameBoundaryPortCommand,
     RenameGroupCommand,
     PasteClipboardCommand,
@@ -945,6 +946,10 @@ class ProjectController(QObject):
         ]
         self.project_state.logging = [s for s in self.project_state.logging if s not in removed_signals]
 
+        for group in self.project_state.visual_groups:
+            if block_uid in group.members:
+                self._remove_boundaries_for_member(group, block_uid)
+
         for i in reversed(range(len(self.project_state.plots))):
             plot = self.project_state.plots[i]
             if str(plot.get("layout", "")).strip().lower() == "manual":
@@ -1384,7 +1389,29 @@ class ProjectController(QObject):
         self.ensure_group_boundary_proxies(group)
         self.view.refresh_visual_groups()
 
-    def _remove_manual_boundary_port(self, group_uid: str, boundary_uid: str) -> None:
+    def _restore_boundary_port(
+        self,
+        group_uid: str,
+        boundary: BoundaryPort,
+        wiring: BoundaryWiringState,
+        connection_snapshot: ConnectionSnapshot | None,
+    ) -> None:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        if any(port.uid == boundary.uid for port in group.boundary_ports):
+            return
+        restored = BoundaryPort.from_dict(boundary.to_dict())
+        apply_wiring_state(restored, wiring)
+        group.boundary_ports.append(restored)
+        self.ensure_group_boundary_proxies(group)
+        if connection_snapshot is not None:
+            connection = self._add_connection_from_snapshot(connection_snapshot)
+            if connection is not None:
+                restored.linked_connection_uid = self._connection_key(connection)
+        self.view.refresh_visual_groups()
+
+    def _remove_boundary_port(self, group_uid: str, boundary_uid: str) -> None:
         group = self.project_state.get_visual_group(group_uid)
         if group is None:
             return
@@ -1452,6 +1479,23 @@ class ProjectController(QObject):
         )
         self.undo_manager.push(AddManualBoundaryCommand(self, group_uid, boundary))
         return boundary
+
+    def remove_boundary_port(self, group_uid: str, boundary_uid: str) -> bool:
+        """Remove a GroupIn/GroupOut boundary port (undoable)."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None:
+            return False
+        self.undo_manager.push(
+            RemoveBoundaryPortCommand(self, group_uid, boundary_uid)
+        )
+        return True
+
+    def remove_manual_boundary_port(self, group_uid: str, boundary_uid: str) -> bool:
+        """Remove a manual GroupIn/GroupOut boundary port (undoable)."""
+        return self.remove_boundary_port(group_uid, boundary_uid)
 
     def _compute_group_layout(self, member_uids: list[str]) -> dict[str, float]:
         """Compute a bounding layout for group members."""
@@ -1523,10 +1567,9 @@ class ProjectController(QObject):
 
     def _connection_key(self, connection: ConnectionInstance) -> str:
         """Build a stable key for one diagram connection."""
-        return (
-            f"{connection.src_block().uid}:{connection.src_port.name}->"
-            f"{connection.dst_block().uid}:{connection.dst_port.name}"
-        )
+        from pySimBlocks.gui.services.group_boundary_service import connection_key
+
+        return connection_key(connection)
 
     def _remove_auto_boundaries_for_member_port(
         self,
@@ -1584,6 +1627,14 @@ class ProjectController(QObject):
         if members.intersection(block_uids):
             return True
 
+        for uid in block_uids:
+            prefix = f"{uid}:"
+            for port in group.boundary_ports:
+                if port.linked_port_uid.startswith(prefix):
+                    return True
+                if port.external_port_uid.startswith(prefix):
+                    return True
+
         for connection in self.project_state.connections:
             src_uid = connection.src_block().uid
             dst_uid = connection.dst_block().uid
@@ -1593,11 +1644,31 @@ class ProjectController(QObject):
                 return True
         return False
 
+    def _group_has_stale_boundaries(self, group: VisualGroup) -> bool:
+        """Return whether auto boundaries no longer match project connections."""
+        members = set(group.members)
+        connection_keys = {
+            self._connection_key(connection)
+            for connection in self.project_state.connections
+        }
+        for port in group.boundary_ports:
+            if port.origin == "manual":
+                continue
+            if port.linked_port_uid:
+                block_uid = port.linked_port_uid.split(":", 1)[0]
+                if block_uid not in members or self._find_block_by_uid(block_uid) is None:
+                    return True
+            if port.linked_connection_uid and port.linked_connection_uid not in connection_keys:
+                return True
+        return False
+
     def _refresh_boundaries_for_member_uids(self, block_uids: set[str]) -> None:
         """Refresh boundary ports for groups affected by block or connection changes."""
         changed = False
         for group in self.project_state.visual_groups:
-            if self._group_needs_boundary_refresh(group, block_uids):
+            if self._group_needs_boundary_refresh(
+                group, block_uids
+            ) or self._group_has_stale_boundaries(group):
                 self._rebuild_group_boundary_ports(group)
                 changed = True
         if changed:

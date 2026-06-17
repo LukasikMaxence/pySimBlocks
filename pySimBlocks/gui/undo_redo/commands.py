@@ -130,6 +130,11 @@ class RemoveBlockCommand(QUndoCommand):
         ]
         self._logging_before = list(controller.project_state.logging)
         self._plots_before = copy.deepcopy(controller.project_state.plots)
+        self._group_snapshots = {
+            group.uid: group.to_dict()
+            for group in controller.project_state.visual_groups
+            if block_instance.uid in group.members
+        }
 
     def redo(self) -> None:
         self._controller._remove_block(self._block_instance)
@@ -141,6 +146,11 @@ class RemoveBlockCommand(QUndoCommand):
             self._controller._add_connection_from_snapshot(snapshot)
         self._controller.project_state.logging = list(self._logging_before)
         self._controller.project_state.plots = copy.deepcopy(self._plots_before)
+        for group_uid, group_snapshot in self._group_snapshots.items():
+            self._controller._apply_group_snapshot(group_snapshot, group_uid)
+            group = self._controller.project_state.get_visual_group(group_uid)
+            if group is not None:
+                self._controller.apply_member_layouts(group)
         self._controller.make_dirty()
 
 
@@ -387,10 +397,50 @@ class AddManualBoundaryCommand(QUndoCommand):
         self._controller.make_dirty()
 
     def undo(self) -> None:
-        self._controller._remove_manual_boundary_port(
+        self._controller._remove_boundary_port(
             self._group_uid, self._boundary.uid
         )
         self._controller.make_dirty()
+
+
+class RemoveBoundaryPortCommand(QUndoCommand):
+    def __init__(self, controller, group_uid: str, boundary_uid: str):
+        super().__init__("Remove Group Port")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._boundary_uid = boundary_uid
+        group = controller.project_state.get_visual_group(group_uid)
+        boundary = (
+            controller._find_boundary_port(group, boundary_uid) if group is not None else None
+        )
+        self._boundary_snapshot = (
+            BoundaryPort.from_dict(boundary.to_dict()) if boundary is not None else None
+        )
+        wiring, connection = controller._capture_boundary_wire_snapshot(
+            group_uid, boundary_uid
+        )
+        self._wiring = wiring
+        self._connection_snapshot = connection
+
+    def redo(self) -> None:
+        if self._boundary_snapshot is None:
+            return
+        self._controller._remove_boundary_port(self._group_uid, self._boundary_uid)
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        if self._boundary_snapshot is None:
+            return
+        self._controller._restore_boundary_port(
+            self._group_uid,
+            self._boundary_snapshot,
+            self._wiring,
+            self._connection_snapshot,
+        )
+        self._controller.make_dirty()
+
+
+RemoveManualBoundaryCommand = RemoveBoundaryPortCommand
 
 
 class MoveProxyLayoutCommand(QUndoCommand):
