@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -62,7 +63,13 @@ class ViewNavigationBar(QWidget):
 
     def _separator(self) -> QLabel:
         label = QLabel("›", self)
-        label.setStyleSheet("color: palette(mid);")
+        font = QFont(label.font())
+        if font.pointSize() > 0:
+            font.setPointSize(font.pointSize() + 2)
+        font.setBold(True)
+        label.setFont(font)
+        label.setStyleSheet("color: palette(windowText); padding: 0 4px;")
+        label.setAlignment(Qt.AlignCenter)
         return label
 
     def _add_segment_button(self, text: str, depth: int, enabled: bool) -> None:
