@@ -935,7 +935,7 @@ class DiagramView(QGraphicsView):
                         self.project_controller.remove_boundary_port(*boundary_key)
                     continue
                 if isinstance(item, GroupItem):
-                    self.project_controller.ungroup(item.group.uid)
+                    self.project_controller.delete_group(item.group.uid)
                 elif isinstance(item, BlockItem):
                     self.project_controller.remove_block(item.instance)
                 elif isinstance(item, ConnectionItem):

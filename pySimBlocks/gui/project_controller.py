@@ -77,6 +77,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     PasteClipboardCommand,
     ToggleOrientationCommand,
     UngroupCommand,
+    DeleteGroupCommand,
     WireManualBoundaryCommand,
     ConnectionSnapshot,
 )
@@ -262,6 +263,13 @@ class ProjectController(QObject):
         if self.project_state.get_visual_group(group_uid) is None:
             return False
         self.undo_manager.push(UngroupCommand(self, group_uid))
+        return True
+
+    def delete_group(self, group_uid: str) -> bool:
+        """Delete a visual group and all its member blocks (undoable)."""
+        if self.project_state.get_visual_group(group_uid) is None:
+            return False
+        self.undo_manager.push(DeleteGroupCommand(self, group_uid))
         return True
 
     def group_selected_blocks(self) -> VisualGroup | None:
@@ -1164,6 +1172,20 @@ class ProjectController(QObject):
     def _remove_visual_group(self, group_uid: str) -> bool:
         """Remove a visual group without pushing undo."""
         return self.project_state.remove_visual_group(group_uid)
+
+    def _delete_group(self, group_uid: str) -> None:
+        """Delete a visual group and all member blocks without pushing undo."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        if group_uid in self.view.view_stack:
+            self.view.navigate_out_of_group(group_uid)
+        for member_uid in list(group.members):
+            block = self._find_block_by_uid(member_uid)
+            if block is not None:
+                self._remove_block(block)
+        self._remove_visual_group(group_uid)
+        self.view.refresh_visual_groups()
 
     def _group_containing_member(self, block_uid: str) -> VisualGroup | None:
         """Return the visual group that lists ``block_uid`` as a member."""
