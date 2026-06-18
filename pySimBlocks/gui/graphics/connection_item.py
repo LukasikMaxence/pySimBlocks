@@ -18,7 +18,7 @@
 #  Authors: see Authors.txt
 # ******************************************************************************
 
-from PySide6.QtCore import Qt, QPointF
+from PySide6.QtCore import Qt, QPointF, QRectF
 from PySide6.QtGui import QPen, QPainterPath, QPainterPathStroker
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem
 
@@ -78,6 +78,7 @@ class ConnectionItem(QGraphicsPathItem):
     PICK_TOL = 10
     GRID = 5
     AXIS_EPS = 0.5
+    JOG_EPS = 8.0
 
     def __init__(self,
                  src_port: PortItem | None,
@@ -141,14 +142,28 @@ class ConnectionItem(QGraphicsPathItem):
         view = self.src_port.parent_block.view
         p1 = view.connection_anchor_for_port_item(self.src_port)
         p2 = view.connection_anchor_for_port_item(self.dst_port)
+
+        if self._route_drag_active:
+            if self.route and len(self.route.points) >= 2:
+                self.route.points[0] = p1
+                self.route.points[-1] = p2
+                self._apply_route(self.route.points, simplify=False)
+            return
+
         if self.is_manual and self.route and len(self.route.points) >= 2:
             self.route.points[0] = p1
             self.route.points[-1] = p2
+            self.route.points = self._simplify_orthogonal_route(self.route.points)
+            if self._route_is_stale(p1, p2, self.route.points):
+                pts = self._compute_auto_route(p1, p2)
+                self.route = OrthogonalRoute(pts)
+                self.is_manual = False
             self._apply_route(self.route.points)
             return
 
         pts = self._compute_auto_route(p1, p2)
         self.route = OrthogonalRoute(pts)
+        self.is_manual = False
         self._apply_route(self.route.points)
 
     def update_temp_position(self, scene_pos: QPointF):
@@ -158,8 +173,7 @@ class ConnectionItem(QGraphicsPathItem):
             scene_pos: Current mouse position in scene coordinates.
         """
         p1 = self._valid_port.connection_anchor()
-        pts = [p1, scene_pos]
-        self._apply_route(pts)
+        self._apply_route([p1, scene_pos], simplify=False)
 
     def apply_manual_route(self, points: list[QPointF]):
         """Apply a persisted manual route to the connection.
@@ -244,21 +258,31 @@ class ConnectionItem(QGraphicsPathItem):
             return
 
         i = self.route.dragged_index
-        a = self.route.points[i]
-        b = self.route.points[i + 1]
+        points = self.route.points
+        if i < 0 or i + 1 >= len(points):
+            self.route.dragged_index = None
+            self._route_drag_active = False
+            self.ungrabMouse()
+            return
+
+        a = points[i]
+        b = points[i + 1]
         pos = event.scenePos()
 
         if abs(a.x() - b.x()) < self.AXIS_EPS:  # vertical segment
             x = self._snap(pos.x())
-            self.route.points[i]     = QPointF(x, a.y())
-            self.route.points[i + 1] = QPointF(x, b.y())
+            points[i] = QPointF(x, a.y())
+            points[i + 1] = QPointF(x, b.y())
 
         elif abs(a.y() - b.y()) < self.AXIS_EPS:  # horizontal segment
             y = self._snap(pos.y())
-            self.route.points[i]     = QPointF(a.x(), y)
-            self.route.points[i + 1] = QPointF(b.x(), y)
+            points[i] = QPointF(a.x(), y)
+            points[i + 1] = QPointF(b.x(), y)
 
-        self._apply_route(self.route.points)
+        else:
+            return
+
+        self._apply_route(points, simplify=False)
 
     def mouseReleaseEvent(self, event):
         """Finish manual segment dragging."""
@@ -270,6 +294,7 @@ class ConnectionItem(QGraphicsPathItem):
             self.ungrabMouse()
         super().mouseReleaseEvent(event)
         if was_dragging and event.button() == Qt.LeftButton and self.route is not None:
+            self._apply_route(self.route.points)
             view = self.src_port.parent_block.view
             new_points = [QPointF(point) for point in self.route.points]
             view.on_connection_route_edited(
@@ -286,12 +311,8 @@ class ConnectionItem(QGraphicsPathItem):
 
     def _compute_auto_route(self, p1: QPointF, p2: QPointF) -> list[QPointF]:
         """Compute an orthogonal route between two port anchors."""
-        src_block = self.src_port.parent_block
-        dst_block = self.dst_port.parent_block
-
-        # Use the visual block rect (not selection handle hit area) for routing.
-        src_rect = src_block.mapRectToScene(src_block.rect())
-        dst_rect = dst_block.mapRectToScene(dst_block.rect())
+        src_rect = self._routing_rect_for_port(self.src_port)
+        dst_rect = self._routing_rect_for_port(self.dst_port)
 
         src_out_sign = 1 if not self.src_port.is_on_left_side else -1
         dst_in_sign = -1 if self.dst_port.is_on_left_side else 1
@@ -299,22 +320,31 @@ class ConnectionItem(QGraphicsPathItem):
         p1_out = QPointF(p1.x() + src_out_sign * self.OFFSET, p1.y())
         p2_in = QPointF(p2.x() + dst_in_sign * self.OFFSET, p2.y())
 
-        same_block = src_block is dst_block
+        same_block = self.src_port.parent_block is self.dst_port.parent_block
         u_turn = ((p2_in.x() - p1_out.x()) * src_out_sign) < 0
         is_feedback = same_block or u_turn
 
         if not is_feedback:
-            mid_x = (p1_out.x() + p2_in.x()) * 0.5
-            candidate = [
-                p1, p1_out,
-                QPointF(mid_x, p1.y()),
-                QPointF(mid_x, p2.y()),
-                p2_in, p2
-            ]
+            if abs(p1.y() - p2.y()) < self.AXIS_EPS:
+                straight = [p1, p1_out, p2_in, p2]
+                path = self._path_from(straight)
+                if not (path.intersects(src_rect) or path.intersects(dst_rect)):
+                    return straight
+
+            if abs(p1.y() - p2.y()) <= self.JOG_EPS:
+                candidate = [p1, p1_out, QPointF(p2.x(), p1.y()), p2]
+            else:
+                mid_x = (p1_out.x() + p2_in.x()) * 0.5
+                candidate = [
+                    p1, p1_out,
+                    QPointF(mid_x, p1.y()),
+                    QPointF(mid_x, p2.y()),
+                    p2_in, p2
+                ]
 
             path = self._path_from(candidate)
             if not (path.intersects(src_rect) or path.intersects(dst_rect)):
-                return candidate
+                return self._simplify_orthogonal_route(candidate)
 
         # fallback / feedback routing
         candidates_y = [
@@ -332,23 +362,93 @@ class ConnectionItem(QGraphicsPathItem):
             key=lambda y: abs(p1.y() - y) + abs(p2.y() - y)
         )
 
-        return [
-            p1, p1_out,
-            QPointF(p1_out.x(), route_y),
-            QPointF(p2_in.x(), route_y),
-            p2_in, p2
-        ]
+        return self._simplify_orthogonal_route(
+            [
+                p1, p1_out,
+                QPointF(p1_out.x(), route_y),
+                QPointF(p2_in.x(), route_y),
+                p2_in, p2
+            ]
+        )
+
+    def _routing_rect_for_port(self, port_item: PortItem) -> QRectF:
+        """Return the scene rectangle used for obstacle avoidance."""
+        block_item = port_item.parent_block
+        view = block_item.view
+        block_uid = port_item.instance.block.uid
+
+        if view.current_view_group_uid is None:
+            for group_item in view.group_items.values():
+                if not group_item.isVisible():
+                    continue
+                if block_uid in group_item.group.members:
+                    return group_item.mapRectToScene(group_item.rect())
+
+        return block_item.mapRectToScene(block_item.rect())
+
+    def _wire_length(self, points: list[QPointF]) -> float:
+        total = 0.0
+        for index in range(len(points) - 1):
+            a = points[index]
+            b = points[index + 1]
+            total += abs(a.x() - b.x()) + abs(a.y() - b.y())
+        return total
+
+    def _simplify_orthogonal_route(self, points: list[QPointF]) -> list[QPointF]:
+        if len(points) <= 2:
+            return [QPointF(point) for point in points]
+
+        simplified = [QPointF(points[0])]
+        for index in range(1, len(points) - 1):
+            prev_pt = simplified[-1]
+            current = points[index]
+            next_pt = points[index + 1]
+            same_vertical = (
+                abs(prev_pt.x() - current.x()) < self.AXIS_EPS
+                and abs(current.x() - next_pt.x()) < self.AXIS_EPS
+            )
+            same_horizontal = (
+                abs(prev_pt.y() - current.y()) < self.AXIS_EPS
+                and abs(current.y() - next_pt.y()) < self.AXIS_EPS
+            )
+            if same_vertical or same_horizontal:
+                continue
+            simplified.append(QPointF(current))
+        simplified.append(QPointF(points[-1]))
+        return simplified
+
+    def _route_is_stale(self, p1: QPointF, p2: QPointF, points: list[QPointF]) -> bool:
+        if len(points) < 2:
+            return True
+
+        for index in range(len(points) - 1):
+            if self._wire_length([points[index], points[index + 1]]) < self.AXIS_EPS:
+                return True
+
+        auto_points = self._compute_auto_route(p1, p2)
+        manual_len = self._wire_length(points)
+        auto_len = self._wire_length(auto_points)
+        return manual_len > auto_len * 1.35 + 30.0
 
     def _snap(self, v: float) -> float:
         """Snap a scalar coordinate to the routing grid."""
         return round(v / self.GRID) * self.GRID
 
-    def _apply_route(self, points: list[QPointF]):
+    def _apply_route(self, points: list[QPointF], *, simplify: bool = True):
         """Apply a route by building and setting the corresponding path."""
-        path = QPainterPath(points[0])
-        for p in points[1:]:
-            path.lineTo(p)
+        cleaned = (
+            self._simplify_orthogonal_route(points)
+            if simplify
+            else [QPointF(point) for point in points]
+        )
+        if len(cleaned) < 2:
+            return
+        path = QPainterPath(cleaned[0])
+        for point in cleaned[1:]:
+            path.lineTo(point)
         self.setPath(path)
+        if self.route is not None:
+            self.route.points = cleaned
 
     def _path_from(self, pts: list[QPointF]) -> QPainterPath:
         """Build a painter path from an ordered list of route points."""
