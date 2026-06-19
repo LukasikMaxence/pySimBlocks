@@ -222,7 +222,7 @@ class ProjectState:
         for group in self.visual_groups:
             if block_uid in group.members:
                 group.members = [uid for uid in group.members if uid != block_uid]
-            if not group.members:
+            if not group.members and not group.child_group_uids:
                 to_remove.append(group)
         for group in to_remove:
             self.visual_groups.remove(group)

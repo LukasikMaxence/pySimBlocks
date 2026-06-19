@@ -163,16 +163,22 @@ class DiagramView(QGraphicsView):
         """Return block instances currently selected on the diagram."""
         selected = []
         for item in self.diagram_scene.selectedItems():
-            if isinstance(item, BlockItem):
+            if isinstance(item, BlockItem) and item.isVisible():
                 selected.append(item.instance)
         return selected
 
+    def get_selected_group_uids(self) -> list[str]:
+        """Return UIDs of all selected visible group items."""
+        uids: list[str] = []
+        for item in self.diagram_scene.selectedItems():
+            if isinstance(item, GroupItem) and item.isVisible():
+                uids.append(item.group.uid)
+        return uids
+
     def get_selected_group_uid(self) -> str | None:
         """Return the UID of a selected group item, if any."""
-        for item in self.diagram_scene.selectedItems():
-            if isinstance(item, GroupItem):
-                return item.group.uid
-        return None
+        uids = self.get_selected_group_uids()
+        return uids[0] if uids else None
 
     def group_item_for_block_drop(self, block_item: BlockItem) -> GroupItem | None:
         """Return the group under a block's center, for drag-and-drop membership."""
@@ -270,7 +276,9 @@ class DiagramView(QGraphicsView):
         state = self.project_controller.project_state
         all_member_uids: set[str] = set()
         for group in state.visual_groups:
-            all_member_uids.update(group.members)
+            all_member_uids.update(
+                self.project_controller._group_content_uids_for_group(group)
+            )
 
         active_uid = self.current_view_group_uid
         active_group = state.get_visual_group(active_uid) if active_uid else None
@@ -309,7 +317,10 @@ class DiagramView(QGraphicsView):
             for block_uid, block_item in self.block_items.items():
                 block_item.setVisible(block_uid not in all_member_uids)
             for group_uid, group_item in self.group_items.items():
-                group_item.setVisible(True)
+                group = state.get_visual_group(group_uid)
+                group_item.setVisible(
+                    group is not None and group.parent_uid is None
+                )
         else:
             member_set = set(active_group.members)
             child_groups = set(active_group.child_group_uids)
@@ -321,16 +332,7 @@ class DiagramView(QGraphicsView):
         for conn_inst, conn_item in self.connections.items():
             src_uid = conn_inst.src_block().uid
             dst_uid = conn_inst.dst_block().uid
-
-            if active_group is None:
-                src_in = src_uid in all_member_uids
-                dst_in = dst_uid in all_member_uids
-                visible = not (src_in and dst_in)
-            else:
-                members = set(active_group.members)
-                src_in = src_uid in members
-                dst_in = dst_uid in members
-                visible = src_in and dst_in or (src_in ^ dst_in)
+            visible = self._connection_visible(active_group, src_uid, dst_uid)
 
             conn_item.setVisible(visible)
             if visible:
@@ -444,6 +446,63 @@ class DiagramView(QGraphicsView):
                     )
             item.setVisible(True)
 
+    def _child_group_uid_for_block(self, parent_group, block_uid: str) -> str | None:
+        """Return the direct child group uid that contains ``block_uid``."""
+        if self.project_controller is None:
+            return None
+        for child_uid in parent_group.child_group_uids:
+            child = self.project_controller.project_state.get_visual_group(child_uid)
+            if child is None:
+                continue
+            if block_uid in self.project_controller._group_content_uids_for_group(child):
+                return child_uid
+        return None
+
+    def _connection_visible(
+        self,
+        active_group,
+        src_uid: str,
+        dst_uid: str,
+    ) -> bool:
+        """Decide whether a connection should be drawn at the current view level."""
+        if self.project_controller is None:
+            return True
+
+        if active_group is None:
+            src_group = self.project_controller._group_exposing_boundary_for_block(
+                src_uid, None
+            )
+            dst_group = self.project_controller._group_exposing_boundary_for_block(
+                dst_uid, None
+            )
+            if src_group is not None and dst_group is not None:
+                return src_group.uid != dst_group.uid
+            return True
+
+        members = set(active_group.members)
+        src_in = src_uid in members
+        dst_in = dst_uid in members
+
+        if active_group.child_group_uids:
+            content_uids = set(
+                self.project_controller._group_content_uids_for_group(active_group)
+            )
+            src_in_content = src_uid in content_uids
+            dst_in_content = dst_uid in content_uids
+
+            if not src_in_content or not dst_in_content:
+                return src_in_content != dst_in_content
+
+            src_child = self._child_group_uid_for_block(active_group, src_uid)
+            dst_child = self._child_group_uid_for_block(active_group, dst_uid)
+            if src_child != dst_child:
+                return True
+            if src_child is None:
+                return src_uid in members and dst_uid in members
+            return False
+
+        return (src_uid in members and dst_uid in members) or (src_in ^ dst_in)
+
     def connection_anchor_for_port_item(self, port_item: PortItem) -> QPointF:
         """Return the scene anchor for a port, redirecting through group borders when collapsed."""
         block_uid = port_item.instance.block.uid
@@ -453,6 +512,19 @@ class DiagramView(QGraphicsView):
         if active_uid and self.project_controller is not None:
             group = self.project_controller.project_state.get_visual_group(active_uid)
             if group is not None:
+                if group.child_group_uids:
+                    child_uid = self._child_group_uid_for_block(group, block_uid)
+                    if child_uid is not None:
+                        child_item = self.group_items.get(child_uid)
+                        if child_item is not None and child_item.isVisible():
+                            boundary_uid = child_item.find_boundary_for_member_port(
+                                block_uid, port_name
+                            )
+                            if boundary_uid is not None:
+                                anchor = child_item.get_boundary_anchor(boundary_uid)
+                                if anchor is not None:
+                                    return anchor
+
                 member_anchor = self._manual_proxy_anchor_for_member_port(group, port_item)
                 if member_anchor is not None:
                     return member_anchor
@@ -462,7 +534,13 @@ class DiagramView(QGraphicsView):
             return port_item.connection_anchor()
 
         for group_item in self.group_items.values():
-            if block_uid not in group_item.group.members:
+            if not group_item.isVisible():
+                continue
+            exposing_group = self.project_controller._group_exposing_boundary_for_block(
+                block_uid,
+                self.current_view_group_uid,
+            )
+            if exposing_group is None or exposing_group.uid != group_item.group.uid:
                 continue
             boundary_uid = group_item.find_boundary_for_member_port(block_uid, port_name)
             if boundary_uid is None:
@@ -492,7 +570,7 @@ class DiagramView(QGraphicsView):
         if self.project_controller is None:
             return None
 
-        members = set(group.members)
+        members = set(self.project_controller._group_content_uids_for_group(group))
         port_instance = port_item.instance
         for connection in self.project_controller.project_state.connections:
             if connection.src_port is not port_instance and connection.dst_port is not port_instance:
@@ -854,15 +932,17 @@ class DiagramView(QGraphicsView):
 
         menu = QMenu(self)
         selected_blocks = self.get_selected_block_instances()
-        selected_group_uid = self.get_selected_group_uid()
+        selected_group_uids = self.get_selected_group_uids()
         clicked_group = self._group_item_at(event)
         clicked_block = self._block_item_at(event)
         target_group_uid = (
-            clicked_group.group.uid if clicked_group is not None else selected_group_uid
+            clicked_group.group.uid if clicked_group is not None else (
+                selected_group_uids[0] if selected_group_uids else None
+            )
         )
 
         group_action = menu.addAction("Group")
-        group_action.setEnabled(len(selected_blocks) >= 2)
+        group_action.setEnabled(len(selected_blocks) + len(selected_group_uids) >= 2)
         group_action.triggered.connect(
             lambda *_args: self.project_controller.group_selected_blocks()
         )

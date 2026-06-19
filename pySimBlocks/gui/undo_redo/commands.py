@@ -191,36 +191,92 @@ class ToggleOrientationCommand(QUndoCommand):
 
 
 class GroupBlocksCommand(QUndoCommand):
-    def __init__(self, controller, blocks: list[BlockInstance], name: str | None = None):
+    def __init__(
+        self,
+        controller,
+        blocks: list[BlockInstance],
+        name: str | None = None,
+        *,
+        child_group_uids: list[str] | None = None,
+        parent_uid: str | None = None,
+    ):
         super().__init__("Group Blocks")
         self._controller = controller
         self._blocks = list(blocks)
         self._name = name
+        self._child_group_uids = list(child_group_uids or [])
+        self._parent_uid = parent_uid
         self._group_uid: str | None = None
         self._group_snapshot: dict | None = None
+        self._child_snapshots_before: dict[str, dict] = {}
+        self._parent_children_before: list[str] | None = None
+        self._parent_snapshot_before: dict | None = None
 
     def redo(self) -> None:
         if self._group_snapshot is not None:
             group = VisualGroup.from_dict(self._group_snapshot)
             self._controller.project_state.visual_groups.append(group)
             self._group_uid = group.uid
+            self._controller.ensure_group_boundary_proxies(group)
+            self._controller._apply_group_creation_side_effects(group)
         else:
-            group = self._controller._create_visual_group(self._blocks, self._name)
+            for child_uid in self._child_group_uids:
+                child = self._controller.project_state.get_visual_group(child_uid)
+                if child is not None:
+                    self._child_snapshots_before[child_uid] = child.to_dict()
+            if self._parent_uid:
+                parent = self._controller.project_state.get_visual_group(self._parent_uid)
+                if parent is not None:
+                    self._parent_children_before = list(parent.child_group_uids)
+                    self._parent_snapshot_before = parent.to_dict()
+
+            group = self._controller._create_visual_group(
+                self._blocks,
+                self._name,
+                child_group_uids=self._child_group_uids,
+                parent_uid=self._parent_uid,
+            )
             self._group_uid = group.uid
             self._group_snapshot = group.to_dict()
         self._controller.view.refresh_visual_groups()
         self._controller.make_dirty()
 
     def undo(self) -> None:
-        if self._group_uid:
-            group = self._controller.project_state.get_visual_group(self._group_uid)
-            if group is not None:
-                self._group_snapshot = group.to_dict()
-            if self._group_uid in self._controller.view.view_stack:
-                self._controller.view.navigate_out_of_group(self._group_uid)
-            self._controller._remove_visual_group(self._group_uid)
-            self._controller.view.refresh_visual_groups()
-            self._controller.make_dirty()
+        if not self._group_uid:
+            return
+        group = self._controller.project_state.get_visual_group(self._group_uid)
+        if group is not None:
+            self._group_snapshot = group.to_dict()
+            self._controller._detach_group_from_parent(group)
+        if self._group_uid in self._controller.view.view_stack:
+            self._controller.view.navigate_out_of_group(self._group_uid)
+        self._controller._remove_visual_group(self._group_uid)
+
+        for child_uid, snapshot in self._child_snapshots_before.items():
+            child = VisualGroup.from_dict(snapshot)
+            replaced = False
+            for index, existing in enumerate(self._controller.project_state.visual_groups):
+                if existing.uid == child_uid:
+                    self._controller.project_state.visual_groups[index] = child
+                    replaced = True
+                    break
+            if not replaced:
+                self._controller.project_state.visual_groups.append(child)
+
+        if self._parent_uid and self._parent_children_before is not None:
+            parent = self._controller.project_state.get_visual_group(self._parent_uid)
+            if parent is not None:
+                parent.child_group_uids = list(self._parent_children_before)
+
+        if self._parent_snapshot_before is not None:
+            parent = VisualGroup.from_dict(self._parent_snapshot_before)
+            for index, existing in enumerate(self._controller.project_state.visual_groups):
+                if existing.uid == parent.uid:
+                    self._controller.project_state.visual_groups[index] = parent
+                    break
+
+        self._controller.view.refresh_visual_groups()
+        self._controller.make_dirty()
 
 
 class UngroupCommand(QUndoCommand):

@@ -202,6 +202,7 @@ def _build_blocks_section(project_state: ProjectState) -> list[dict]:
                 "name": b.name,
                 "category": b.meta.category,
                 "type": b.meta.type,
+                "uid": b.uid,
                 "parameters": params,
             }
         )

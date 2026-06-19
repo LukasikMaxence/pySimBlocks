@@ -237,8 +237,15 @@ class ProjectController(QObject):
         """
         self.undo_manager.push(RemoveBlockCommand(self, block_instance))
 
-    def group_blocks(self, blocks: list[BlockInstance], name: str | None = None) -> VisualGroup | None:
-        """Create a visual group from an explicit block selection (undoable)."""
+    def group_blocks(
+        self,
+        blocks: list[BlockInstance],
+        name: str | None = None,
+        *,
+        child_group_uids: list[str] | None = None,
+        parent_uid: str | None = None,
+    ) -> VisualGroup | None:
+        """Create a visual group from blocks and/or child groups (undoable)."""
         unique_blocks: list[BlockInstance] = []
         seen = set()
         for block in blocks:
@@ -247,13 +254,35 @@ class ProjectController(QObject):
             seen.add(block.uid)
             unique_blocks.append(block)
 
-        if len(unique_blocks) < 2:
-            raise ValueError("At least two blocks are required to create a group.")
+        child_uids = list(dict.fromkeys(child_group_uids or []))
+        if parent_uid is None:
+            parent_uid = self.view.current_view_group_uid
 
-        self.undo_manager.push(GroupBlocksCommand(self, unique_blocks, name))
-        member_uids = {b.uid for b in unique_blocks}
+        if len(unique_blocks) + len(child_uids) < 2:
+            return None
+
+        for block in unique_blocks:
+            if not self._block_at_view_level(block.uid, parent_uid):
+                return None
+
+        for child_uid in child_uids:
+            child = self.project_state.get_visual_group(child_uid)
+            if child is None or child.parent_uid != parent_uid:
+                return None
+
+        self.undo_manager.push(
+            GroupBlocksCommand(
+                self,
+                unique_blocks,
+                name,
+                child_group_uids=child_uids,
+                parent_uid=parent_uid,
+            )
+        )
         for group in reversed(self.project_state.visual_groups):
-            if set(group.members) == member_uids:
+            if set(group.members) == {b.uid for b in unique_blocks} and set(
+                group.child_group_uids
+            ) == set(child_uids):
                 return group
         return None
 
@@ -265,11 +294,16 @@ class ProjectController(QObject):
         return True
 
     def group_selected_blocks(self) -> VisualGroup | None:
-        """Group currently selected blocks in the diagram view."""
+        """Group the current diagram selection of blocks and/or groups."""
         blocks = self.view.get_selected_block_instances()
-        if len(blocks) < 2:
+        child_uids = self.view.get_selected_group_uids()
+        if len(blocks) + len(child_uids) < 2:
             return None
-        return self.group_blocks(blocks)
+        return self.group_blocks(
+            blocks,
+            child_group_uids=child_uids,
+            parent_uid=self.view.current_view_group_uid,
+        )
 
     def ungroup_selected_group(self) -> bool:
         """Ungroup the currently selected visual group."""
@@ -763,6 +797,8 @@ class ProjectController(QObject):
         loader.load(self, self.project_state.directory_path)
         for group in self.project_state.visual_groups:
             self.ensure_group_boundary_proxies(group)
+        for group in self.project_state.visual_groups:
+            self.apply_member_layouts(group)
         self.view.refresh_visual_groups()
 
 
@@ -1144,21 +1180,138 @@ class ProjectController(QObject):
         self,
         blocks: list[BlockInstance],
         name: str | None = None,
+        *,
+        child_group_uids: list[str] | None = None,
+        parent_uid: str | None = None,
     ) -> VisualGroup:
         """Create and register a visual group without pushing undo."""
+        if parent_uid is None:
+            parent_uid = self.view.current_view_group_uid
+
         member_uids = [b.uid for b in blocks]
+        child_uids = list(dict.fromkeys(child_group_uids or []))
+        content_uids = self._group_content_uids(member_uids, child_uids)
+
         group = VisualGroup(
             uid=uuid.uuid4().hex,
             name=self._make_unique_group_name(name or "Group"),
             members=member_uids,
-            parent_uid=None,
-            layout=self._compute_group_layout(member_uids),
-            boundary_ports=self._build_group_boundary_ports(member_uids),
-            child_group_uids=[],
+            parent_uid=parent_uid,
+            layout=self._compute_group_layout(member_uids, child_uids),
+            boundary_ports=self._build_group_boundary_ports(content_uids),
+            child_group_uids=child_uids,
             member_layouts=self._capture_member_layouts(member_uids),
         )
         self.ensure_group_boundary_proxies(group)
         self.project_state.visual_groups.append(group)
+        self._apply_group_creation_side_effects(group)
+        return group
+
+    def _group_content_uids(
+        self,
+        member_uids: list[str],
+        child_group_uids: list[str] | None = None,
+    ) -> list[str]:
+        """Return all block uids contained in a group selection."""
+        content: set[str] = set(member_uids)
+        for child_uid in child_group_uids or []:
+            child = self.project_state.get_visual_group(child_uid)
+            if child is None:
+                continue
+            content.update(self._group_content_uids(child.members, child.child_group_uids))
+        return list(content)
+
+    def _group_content_uids_for_group(self, group: VisualGroup) -> list[str]:
+        """Return all block uids owned by a group and its descendants."""
+        return self._group_content_uids(group.members, group.child_group_uids)
+
+    def _apply_group_creation_side_effects(self, group: VisualGroup) -> None:
+        """Link a newly created group to its parent and child groups."""
+        self._attach_group_to_parent(group)
+        if group.parent_uid:
+            parent = self.project_state.get_visual_group(group.parent_uid)
+            if parent is not None:
+                moved_uids = set(group.members)
+                if moved_uids.intersection(parent.members):
+                    parent.members = [
+                        uid for uid in parent.members if uid not in moved_uids
+                    ]
+                    self._rebuild_group_boundary_ports(parent)
+        for child_uid in group.child_group_uids:
+            self._reparent_child_group(child_uid, group.uid)
+
+    def _attach_group_to_parent(self, group: VisualGroup) -> None:
+        """Register a new group under its parent container."""
+        if not group.parent_uid:
+            return
+        parent = self.project_state.get_visual_group(group.parent_uid)
+        if parent is None:
+            group.parent_uid = None
+            return
+        if group.uid not in parent.child_group_uids:
+            parent.child_group_uids.append(group.uid)
+
+    def _reparent_child_group(self, child_uid: str, new_parent_uid: str) -> None:
+        """Move a child group under a new parent group."""
+        child = self.project_state.get_visual_group(child_uid)
+        if child is None:
+            return
+        old_parent_uid = child.parent_uid
+        if old_parent_uid and old_parent_uid != new_parent_uid:
+            old_parent = self.project_state.get_visual_group(old_parent_uid)
+            if old_parent is not None:
+                old_parent.child_group_uids = [
+                    uid for uid in old_parent.child_group_uids if uid != child_uid
+                ]
+        child.parent_uid = new_parent_uid
+
+    def _detach_group_from_parent(self, group: VisualGroup) -> None:
+        """Remove a group from its parent's child list."""
+        if not group.parent_uid:
+            return
+        parent = self.project_state.get_visual_group(group.parent_uid)
+        if parent is None:
+            return
+        parent.child_group_uids = [
+            uid for uid in parent.child_group_uids if uid != group.uid
+        ]
+
+    def _promote_child_groups(self, group: VisualGroup) -> None:
+        """Reparent child groups to the dissolved group's parent."""
+        grandparent_uid = group.parent_uid
+        for child_uid in list(group.child_group_uids):
+            child = self.project_state.get_visual_group(child_uid)
+            if child is None:
+                continue
+            child.parent_uid = grandparent_uid
+            if grandparent_uid:
+                grandparent = self.project_state.get_visual_group(grandparent_uid)
+                if grandparent is not None and child_uid not in grandparent.child_group_uids:
+                    grandparent.child_group_uids.append(child_uid)
+
+    def _block_at_view_level(self, block_uid: str, view_group_uid: str | None) -> bool:
+        """Return whether a block is a direct member of the active view level."""
+        owner = self._group_containing_member(block_uid)
+        if view_group_uid is None:
+            return owner is None
+        return owner is not None and owner.uid == view_group_uid
+
+    def _group_exposing_boundary_for_block(
+        self,
+        block_uid: str,
+        view_group_uid: str | None,
+    ) -> VisualGroup | None:
+        """Return the group whose border should expose a member port at this view level."""
+        group = self._group_containing_member(block_uid)
+        if group is None:
+            return None
+        while group.parent_uid != view_group_uid:
+            if group.parent_uid is None:
+                return group if view_group_uid is None else None
+            parent = self.project_state.get_visual_group(group.parent_uid)
+            if parent is None:
+                return None
+            group = parent
         return group
 
     def _remove_visual_group(self, group_uid: str) -> bool:
@@ -1241,7 +1394,7 @@ class ProjectController(QObject):
         group.members = [uid for uid in group.members if uid != block_uid]
         group.member_layouts.pop(block_uid, None)
 
-        if not group.members:
+        if not group.members and not group.child_group_uids:
             if group_uid in self.view.view_stack:
                 self.view.navigate_out_of_group(group_uid)
             self._remove_visual_group(group_uid)
@@ -1310,7 +1463,9 @@ class ProjectController(QObject):
             group.member_layouts[uid] = self._capture_block_layout(block)
 
     def restore_members_after_ungroup(self, group: VisualGroup) -> None:
-        """Place ungrouped members using their internal layouts."""
+        """Place ungrouped members and promote child groups to the parent level."""
+        self._promote_child_groups(group)
+        self._detach_group_from_parent(group)
         self.apply_member_layouts(group)
 
     def ensure_group_boundary_proxies(self, group: VisualGroup) -> None:
@@ -1497,8 +1652,12 @@ class ProjectController(QObject):
         """Remove a manual GroupIn/GroupOut boundary port (undoable)."""
         return self.remove_boundary_port(group_uid, boundary_uid)
 
-    def _compute_group_layout(self, member_uids: list[str]) -> dict[str, float]:
-        """Compute a bounding layout for group members."""
+    def _compute_group_layout(
+        self,
+        member_uids: list[str],
+        child_group_uids: list[str] | None = None,
+    ) -> dict[str, float]:
+        """Compute a bounding layout for group members and child groups."""
         margin = 16.0
         min_x = float("inf")
         min_y = float("inf")
@@ -1511,6 +1670,17 @@ class ProjectController(QObject):
             if block is None:
                 continue
             item = self.view.get_block_item_from_instance(block)
+            if item is None:
+                continue
+            found = True
+            rect = item.sceneBoundingRect()
+            min_x = min(min_x, rect.left())
+            min_y = min(min_y, rect.top())
+            max_x = max(max_x, rect.right())
+            max_y = max(max_y, rect.bottom())
+
+        for child_uid in child_group_uids or []:
+            item = self.view.group_items.get(child_uid)
             if item is None:
                 continue
             found = True
@@ -1604,7 +1774,9 @@ class ProjectController(QObject):
         }
 
         rebuilt_auto: list[BoundaryPort] = []
-        for port in self._build_group_boundary_ports(group.members):
+        for port in self._build_group_boundary_ports(
+            self._group_content_uids_for_group(group)
+        ):
             if port.linked_port_uid in manual_member_keys:
                 continue
             previous = existing_auto.get(port.linked_port_uid)
@@ -1623,7 +1795,7 @@ class ProjectController(QObject):
         block_uids: set[str],
     ) -> bool:
         """Return whether a group may need boundary ports recomputed."""
-        members = set(group.members)
+        members = set(self._group_content_uids_for_group(group))
         if members.intersection(block_uids):
             return True
 
@@ -1646,7 +1818,7 @@ class ProjectController(QObject):
 
     def _group_has_stale_boundaries(self, group: VisualGroup) -> bool:
         """Return whether auto boundaries no longer match project connections."""
-        members = set(group.members)
+        members = set(self._group_content_uids_for_group(group))
         connection_keys = {
             self._connection_key(connection)
             for connection in self.project_state.connections
