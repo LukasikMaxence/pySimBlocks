@@ -329,6 +329,9 @@ class DiagramView(QGraphicsView):
             for group_uid, group_item in self.group_items.items():
                 group_item.setVisible(group_uid in child_groups)
 
+        self._refresh_group_proxies(active_group)
+        self._refresh_group_port_labels()
+
         for conn_inst, conn_item in self.connections.items():
             src_uid = conn_inst.src_block().uid
             dst_uid = conn_inst.dst_block().uid
@@ -338,8 +341,6 @@ class DiagramView(QGraphicsView):
             if visible:
                 conn_item.update_position()
 
-        self._refresh_group_proxies(active_group)
-        self._refresh_group_port_labels()
         self.refresh_manual_boundary_wires()
 
     def refresh_manual_boundary_wires(self) -> None:
