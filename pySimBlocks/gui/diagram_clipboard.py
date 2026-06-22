@@ -39,7 +39,8 @@ class DiagramClipboard:
 
     blocks: list[ClipboardBlock] = field(default_factory=list)
     connections: list[ConnectionSnapshot] = field(default_factory=list)
-    group: dict[str, Any] | None = None
+    groups: list[dict[str, Any]] = field(default_factory=list)
+    root_group_uids: list[str] = field(default_factory=list)
     anchor_x: float = 0.0
     anchor_y: float = 0.0
 
@@ -69,6 +70,73 @@ def _offset_layout(layout: dict[str, Any], dx: float, dy: float) -> dict[str, An
     return out
 
 
+def _collect_subgroup_uids_postorder(
+    controller: ProjectController,
+    group_uid: str,
+) -> list[str]:
+    """Return group uids in a subtree, children before parents."""
+    group = controller.project_state.get_visual_group(group_uid)
+    if group is None:
+        return []
+    ordered: list[str] = []
+    for child_uid in group.child_group_uids:
+        ordered.extend(_collect_subgroup_uids_postorder(controller, child_uid))
+    ordered.append(group_uid)
+    return ordered
+
+
+def _root_groups_in_selection(
+    controller: ProjectController,
+    group_uids: set[str],
+) -> list[str]:
+    """Return selected groups whose parent is outside the selection."""
+    roots: list[str] = []
+    for uid in group_uids:
+        group = controller.project_state.get_visual_group(uid)
+        if group is None:
+            continue
+        if group.parent_uid not in group_uids:
+            roots.append(uid)
+    return roots
+
+
+def _ordered_group_uids(
+    controller: ProjectController,
+    root_group_uids: list[str],
+) -> list[str]:
+    """Collect subtrees from several roots without duplicates (post-order)."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for root_uid in root_group_uids:
+        for group_uid in _collect_subgroup_uids_postorder(controller, root_uid):
+            if group_uid in seen:
+                continue
+            ordered.append(group_uid)
+            seen.add(group_uid)
+    return ordered
+
+
+def _capture_internal_connections(
+    controller: ProjectController,
+    member_uids: set[str],
+) -> list[ConnectionSnapshot]:
+    connections: list[ConnectionSnapshot] = []
+    for connection in controller.project_state.connections:
+        src_uid = connection.src_block().uid
+        dst_uid = connection.dst_block().uid
+        if src_uid in member_uids and dst_uid in member_uids:
+            connections.append(controller._capture_connection_snapshot(connection))
+    return connections
+
+
+def _block_uids_in_group_templates(templates: list[dict[str, Any]]) -> set[str]:
+    return {
+        uid
+        for template in templates
+        for uid in template.get("members", [])
+    }
+
+
 def capture_blocks_clipboard(
     controller: ProjectController,
     block_items: list[BlockItem],
@@ -96,17 +164,88 @@ def capture_blocks_clipboard(
             )
         )
 
-    connections: list[ConnectionSnapshot] = []
-    for connection in controller.project_state.connections:
-        src_uid = connection.src_block().uid
-        dst_uid = connection.dst_block().uid
-        if src_uid in member_uids and dst_uid in member_uids:
-            connections.append(controller._capture_connection_snapshot(connection))
-
     anchor_x, anchor_y = _layout_anchor(layouts)
     return DiagramClipboard(
         blocks=blocks,
-        connections=connections,
+        connections=_capture_internal_connections(controller, member_uids),
+        anchor_x=anchor_x,
+        anchor_y=anchor_y,
+    )
+
+
+def capture_groups_clipboard(
+    controller: ProjectController,
+    selected_group_uids: list[str],
+) -> DiagramClipboard | None:
+    """Capture one or more visual groups with nested children and internal wiring."""
+    if not selected_group_uids:
+        return None
+
+    selected_set = set(selected_group_uids)
+    root_group_uids = _root_groups_in_selection(controller, selected_set)
+    ordered_group_uids = _ordered_group_uids(controller, root_group_uids)
+    if not ordered_group_uids:
+        return None
+
+    blocks: list[ClipboardBlock] = []
+    seen_block_uids: set[str] = set()
+    anchor_layouts: list[dict[str, Any]] = []
+
+    for group_uid in ordered_group_uids:
+        group = controller.project_state.get_visual_group(group_uid)
+        if group is None:
+            continue
+        for member_uid in group.members:
+            if member_uid in seen_block_uids:
+                continue
+            block = controller._find_block_by_uid(member_uid)
+            if block is None:
+                continue
+            layout = dict(group.member_layouts.get(member_uid, {}))
+            if not layout:
+                layout = controller._capture_block_layout(block)
+            seen_block_uids.add(member_uid)
+            blocks.append(
+                ClipboardBlock(
+                    source_uid=block.uid,
+                    category=block.meta.category,
+                    block_type=block.meta.type,
+                    name=block.name,
+                    parameters=block.parameters.copy(),
+                    layout=layout,
+                )
+            )
+
+    for root_uid in root_group_uids:
+        root = controller.project_state.get_visual_group(root_uid)
+        if root is None:
+            continue
+        if root.layout:
+            anchor_layouts.append(dict(root.layout))
+        else:
+            member_layouts = [
+                dict(root.member_layouts.get(uid, {}))
+                for uid in root.members
+                if uid in root.member_layouts
+            ]
+            if member_layouts:
+                anchor_layouts.extend(member_layouts)
+
+    if not blocks and not ordered_group_uids:
+        return None
+
+    anchor_x, anchor_y = _layout_anchor(anchor_layouts)
+    groups = [
+        copy.deepcopy(controller.project_state.get_visual_group(group_uid).to_dict())
+        for group_uid in ordered_group_uids
+        if controller.project_state.get_visual_group(group_uid) is not None
+    ]
+
+    return DiagramClipboard(
+        blocks=blocks,
+        connections=_capture_internal_connections(controller, seen_block_uids),
+        groups=groups,
+        root_group_uids=root_group_uids,
         anchor_x=anchor_x,
         anchor_y=anchor_y,
     )
@@ -116,54 +255,58 @@ def capture_group_clipboard(
     controller: ProjectController,
     group: VisualGroup,
 ) -> DiagramClipboard | None:
-    """Capture a visual group, its members, and internal connections."""
-    block_items: list[BlockItem] = []
-    layouts: list[dict[str, Any]] = []
-    blocks: list[ClipboardBlock] = []
+    """Capture a visual group, its descendants, and internal connections."""
+    return capture_groups_clipboard(controller, [group.uid])
 
-    for member_uid in group.members:
-        block = controller._find_block_by_uid(member_uid)
-        if block is None:
+
+def _capture_mixed_selection_clipboard(
+    controller: ProjectController,
+    selected_group_uids: list[str],
+    block_items: list[BlockItem],
+) -> DiagramClipboard | None:
+    """Capture selected groups (full subtrees) plus standalone blocks."""
+    group_clipboard = capture_groups_clipboard(controller, selected_group_uids)
+    selected_set = set(selected_group_uids)
+    grouped_block_uids: set[str] = set()
+    for group_uid in selected_set:
+        group = controller.project_state.get_visual_group(group_uid)
+        if group is None:
             continue
-        layout = dict(group.member_layouts.get(member_uid, {}))
-        if not layout:
-            item = controller.view.get_block_item_from_instance(block)
-            if item is not None:
-                layout = controller._capture_block_layout(block)
-        layouts.append(layout)
-        blocks.append(
-            ClipboardBlock(
-                source_uid=block.uid,
-                category=block.meta.category,
-                block_type=block.meta.type,
-                name=block.name,
-                parameters=block.parameters.copy(),
-                layout=layout,
-            )
-        )
-        item = controller.view.get_block_item_from_instance(block)
-        if item is not None:
-            block_items.append(item)
+        grouped_block_uids.update(controller._group_content_uids_for_group(group))
 
-    if not blocks:
+    standalone_items = [
+        item for item in block_items if item.instance.uid not in grouped_block_uids
+    ]
+    if group_clipboard is None and not standalone_items:
         return None
+    if group_clipboard is None:
+        return capture_blocks_clipboard(controller, standalone_items)
 
-    member_uids = {block.source_uid for block in blocks}
-    connections: list[ConnectionSnapshot] = []
-    for connection in controller.project_state.connections:
-        src_uid = connection.src_block().uid
-        dst_uid = connection.dst_block().uid
-        if src_uid in member_uids and dst_uid in member_uids:
-            connections.append(controller._capture_connection_snapshot(connection))
+    if not standalone_items:
+        return group_clipboard
 
-    group_layout = group.layout or {}
-    anchor_x = float(group_layout.get("x", _layout_anchor(layouts)[0]))
-    anchor_y = float(group_layout.get("y", _layout_anchor(layouts)[1]))
+    block_clipboard = capture_blocks_clipboard(controller, standalone_items)
+    if block_clipboard is None:
+        return group_clipboard
 
+    all_member_uids = {
+        block.source_uid for block in group_clipboard.blocks + block_clipboard.blocks
+    }
+    anchor_layouts = [
+        dict(block.layout)
+        for block in block_clipboard.blocks
+    ]
+    for root_uid in group_clipboard.root_group_uids:
+        root = controller.project_state.get_visual_group(root_uid)
+        if root is not None and root.layout:
+            anchor_layouts.append(dict(root.layout))
+
+    anchor_x, anchor_y = _layout_anchor(anchor_layouts)
     return DiagramClipboard(
-        blocks=blocks,
-        connections=connections,
-        group=copy.deepcopy(group.to_dict()),
+        blocks=group_clipboard.blocks + block_clipboard.blocks,
+        connections=_capture_internal_connections(controller, all_member_uids),
+        groups=group_clipboard.groups,
+        root_group_uids=group_clipboard.root_group_uids,
         anchor_x=anchor_x,
         anchor_y=anchor_y,
     )
@@ -178,8 +321,14 @@ def capture_selection_clipboard(controller: ProjectController) -> DiagramClipboa
     groups = [item for item in selected if isinstance(item, GroupItem)]
     blocks = [item for item in selected if isinstance(item, BlockItem)]
 
-    if len(groups) == 1 and not blocks:
-        return capture_group_clipboard(controller, groups[0].group)
+    if groups and blocks:
+        return _capture_mixed_selection_clipboard(
+            controller,
+            [item.group.uid for item in groups],
+            blocks,
+        )
+    if groups:
+        return capture_groups_clipboard(controller, [item.group.uid for item in groups])
     if blocks:
         return capture_blocks_clipboard(controller, blocks)
     return None
@@ -209,15 +358,18 @@ def _duplicate_group(
     controller: ProjectController,
     template: dict[str, Any],
     uid_map: dict[str, str],
+    gid_map: dict[str, str],
     dx: float,
     dy: float,
-    parent_uid: str | None,
 ) -> VisualGroup:
     group = VisualGroup.from_dict(copy.deepcopy(template))
     group.uid = uuid.uuid4().hex
     group.name = controller._make_unique_group_name(group.name)
-    group.parent_uid = parent_uid
+    group.parent_uid = None
     group.members = [uid_map[uid] for uid in template.get("members", []) if uid in uid_map]
+    group.child_group_uids = [
+        gid_map[uid] for uid in template.get("child_group_uids", []) if uid in gid_map
+    ]
 
     member_layouts: dict[str, dict[str, Any]] = {}
     for old_uid, layout in (template.get("member_layouts") or {}).items():
@@ -264,46 +416,76 @@ def paste_clipboard(
 ) -> PasteResult:
     """Paste clipboard contents at ``origin`` without pushing undo."""
     result = PasteResult()
-    if not clipboard.blocks:
+    if not clipboard.blocks and not clipboard.groups:
         return result
 
     dx = float(origin.x()) - clipboard.anchor_x
     dy = float(origin.y()) - clipboard.anchor_y
     uid_map: dict[str, str] = {}
+    has_groups = bool(clipboard.groups)
+    grouped_source_uids = _block_uids_in_group_templates(clipboard.groups)
 
     for block_data in clipboard.blocks:
         meta = controller.resolve_block_meta(block_data.category, block_data.block_type)
         block = BlockInstance(meta)
         block.parameters = block_data.parameters.copy()
         block.name = block_data.name
-        if clipboard.group is not None:
+        if has_groups and block_data.source_uid in grouped_source_uids:
             layout = dict(block_data.layout)
         else:
             layout = _offset_layout(block_data.layout, dx, dy)
         created = controller._add_block(block, layout)
         uid_map[block_data.source_uid] = created.uid
         result.blocks.append(created)
-        if parent_group_uid is not None and clipboard.group is None:
+        if (
+            parent_group_uid is not None
+            and (not has_groups or block_data.source_uid not in grouped_source_uids)
+        ):
             controller._add_member_to_group(parent_group_uid, created.uid, layout)
 
+    connection_offset_dx = 0.0 if has_groups else dx
+    connection_offset_dy = 0.0 if has_groups else dy
     for snapshot in clipboard.connections:
-        remapped = _remap_connection(snapshot, uid_map, dx, dy)
+        remapped = _remap_connection(
+            snapshot,
+            uid_map,
+            connection_offset_dx,
+            connection_offset_dy,
+        )
         if remapped is None:
             continue
         connection = controller._add_connection_from_snapshot(remapped)
         if connection is not None:
             result.connections.append(connection)
 
-    if clipboard.group is not None:
+    gid_map: dict[str, str] = {}
+    created_groups: list[tuple[dict[str, Any], VisualGroup]] = []
+    for template in clipboard.groups:
+        old_uid = str(template["uid"])
+        root_offset_dx = dx if old_uid in clipboard.root_group_uids else 0.0
+        root_offset_dy = dy if old_uid in clipboard.root_group_uids else 0.0
         group = _duplicate_group(
             controller,
-            clipboard.group,
+            template,
             uid_map,
-            dx,
-            dy,
-            parent_group_uid,
+            gid_map,
+            root_offset_dx,
+            root_offset_dy,
         )
+        gid_map[old_uid] = group.uid
+        created_groups.append((template, group))
         result.group_uids.append(group.uid)
+
+    for template, group in created_groups:
+        old_uid = str(template["uid"])
+        parent_old = template.get("parent_uid")
+        if parent_old and parent_old in gid_map:
+            group.parent_uid = gid_map[str(parent_old)]
+            controller._attach_group_to_parent(group)
+        elif old_uid in clipboard.root_group_uids:
+            group.parent_uid = parent_group_uid
+            if parent_group_uid is not None:
+                controller._attach_group_to_parent(group)
 
     controller.view.refresh_visual_groups()
     return result
@@ -311,7 +493,7 @@ def paste_clipboard(
 
 def undo_paste(controller: ProjectController, result: PasteResult) -> None:
     """Remove entities created by a paste operation."""
-    for group_uid in result.group_uids:
+    for group_uid in reversed(result.group_uids):
         if group_uid in controller.view.view_stack:
             controller.view.navigate_out_of_group(group_uid)
         controller._remove_visual_group(group_uid)
