@@ -301,8 +301,71 @@ class UngroupCommand(QUndoCommand):
         if self._group_snapshot:
             group = VisualGroup.from_dict(self._group_snapshot)
             self._controller.project_state.visual_groups.append(group)
-            self._controller.view.refresh_visual_groups()
-            self._controller.make_dirty()
+        self._controller.view.refresh_visual_groups()
+        self._controller.make_dirty()
+
+
+class DeleteGroupCommand(QUndoCommand):
+    def __init__(self, controller, group_uid: str):
+        super().__init__("Delete Group")
+        self._controller = controller
+        self._root_group_uid = group_uid
+        self._group_snapshots: dict[str, dict] = {}
+        self._group_uids_order: list[str] = []
+        self._members: list[tuple[BlockInstance, dict]] = []
+        self._connections: list[ConnectionSnapshot] = []
+
+        group_uids, block_uids = controller._collect_group_delete_targets(group_uid)
+        self._group_uids_order = group_uids
+        for uid in group_uids:
+            group = controller.project_state.get_visual_group(uid)
+            if group is not None:
+                self._group_snapshots[uid] = group.to_dict()
+
+        seen_blocks: set[str] = set()
+        seen_connections: set[int] = set()
+        for member_uid in block_uids:
+            if member_uid in seen_blocks:
+                continue
+            seen_blocks.add(member_uid)
+            block = controller._find_block_by_uid(member_uid)
+            if block is None:
+                continue
+            self._members.append(
+                (block, controller._capture_block_layout(block))
+            )
+            for connection in controller.project_state.get_connections_of_block(block):
+                conn_id = id(connection)
+                if conn_id in seen_connections:
+                    continue
+                seen_connections.add(conn_id)
+                self._connections.append(
+                    controller._capture_connection_snapshot(connection)
+                )
+
+        self._logging_before = list(controller.project_state.logging)
+        self._plots_before = copy.deepcopy(controller.project_state.plots)
+
+    def redo(self) -> None:
+        self._controller._delete_group(self._root_group_uid)
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        for block, layout in self._members:
+            self._controller._add_block(block, layout)
+        for snapshot in self._connections:
+            self._controller._add_connection_from_snapshot(snapshot)
+        self._controller.project_state.logging = list(self._logging_before)
+        self._controller.project_state.plots = copy.deepcopy(self._plots_before)
+        for uid in self._group_uids_order:
+            snapshot = self._group_snapshots.get(uid)
+            if snapshot is not None:
+                self._controller._apply_group_snapshot(snapshot, uid)
+        for uid in self._group_uids_order:
+            group = self._controller.project_state.get_visual_group(uid)
+            if group is not None:
+                self._controller.apply_member_layouts(group)
+        self._controller.make_dirty()
 
 
 class AddToGroupCommand(QUndoCommand):

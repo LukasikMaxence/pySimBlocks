@@ -77,6 +77,7 @@ from pySimBlocks.gui.undo_redo.commands import (
     PasteClipboardCommand,
     ToggleOrientationCommand,
     UngroupCommand,
+    DeleteGroupCommand,
     WireManualBoundaryCommand,
     ConnectionSnapshot,
 )
@@ -291,6 +292,13 @@ class ProjectController(QObject):
         if self.project_state.get_visual_group(group_uid) is None:
             return False
         self.undo_manager.push(UngroupCommand(self, group_uid))
+        return True
+
+    def delete_group(self, group_uid: str) -> bool:
+        """Delete a visual group and all nested content (undoable)."""
+        if self.project_state.get_visual_group(group_uid) is None:
+            return False
+        self.undo_manager.push(DeleteGroupCommand(self, group_uid))
         return True
 
     def group_selected_blocks(self) -> VisualGroup | None:
@@ -1317,6 +1325,39 @@ class ProjectController(QObject):
     def _remove_visual_group(self, group_uid: str) -> bool:
         """Remove a visual group without pushing undo."""
         return self.project_state.remove_visual_group(group_uid)
+
+    def _collect_group_delete_targets(
+        self, group_uid: str
+    ) -> tuple[list[str], list[str]]:
+        """Return nested group uids (children first) and all member block uids."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return [], []
+        group_uids: list[str] = []
+        block_uids: list[str] = []
+        for child_uid in group.child_group_uids:
+            child_groups, child_blocks = self._collect_group_delete_targets(child_uid)
+            group_uids.extend(child_groups)
+            block_uids.extend(child_blocks)
+        block_uids.extend(group.members)
+        group_uids.append(group_uid)
+        return group_uids, block_uids
+
+    def _delete_group(self, group_uid: str) -> None:
+        """Delete a visual group, its descendants, and all member blocks."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return
+        if group_uid in self.view.view_stack:
+            self.view.navigate_out_of_group(group_uid)
+        for child_uid in list(group.child_group_uids):
+            self._delete_group(child_uid)
+        for member_uid in list(group.members):
+            block = self._find_block_by_uid(member_uid)
+            if block is not None:
+                self._remove_block(block)
+        self._remove_visual_group(group_uid)
+        self.view.refresh_visual_groups()
 
     def _group_containing_member(self, block_uid: str) -> VisualGroup | None:
         """Return the visual group that lists ``block_uid`` as a member."""
