@@ -107,6 +107,9 @@ class RemoveConnectionCommand(QUndoCommand):
         self._controller = controller
         self._snapshot = controller._capture_connection_snapshot(connection_instance)
         self._connection_instance = connection_instance
+        self._boundary_snapshots = controller._capture_boundaries_for_connection(
+            connection_instance
+        )
 
     def redo(self) -> None:
         if self._connection_instance is not None:
@@ -114,7 +117,10 @@ class RemoveConnectionCommand(QUndoCommand):
             self._controller.make_dirty()
 
     def undo(self) -> None:
-        self._connection_instance = self._controller._add_connection_from_snapshot(self._snapshot)
+        self._connection_instance = self._controller._add_connection_from_snapshot(
+            self._snapshot
+        )
+        self._controller._restore_boundary_snapshots(self._boundary_snapshots)
         self._controller.make_dirty()
 
 

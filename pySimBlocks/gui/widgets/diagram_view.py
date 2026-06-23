@@ -378,6 +378,9 @@ class DiagramView(QGraphicsView):
                     self,
                     proxy.member_anchor,
                     port_item.connection_anchor,
+                    group_uid=active_uid,
+                    boundary_uid=boundary.uid,
+                    side="internal",
                 )
                 self.diagram_scene.addItem(wire)
                 self.manual_boundary_wires[f"{boundary.uid}:internal"] = wire
@@ -392,9 +395,8 @@ class DiagramView(QGraphicsView):
                     continue
                 if not boundary.external_port_uid:
                     continue
-                boundary_item = group_item.boundary_port_items.get(boundary.uid)
                 external_port = find_port(state, boundary.external_port_uid)
-                if boundary_item is None or external_port is None:
+                if external_port is None:
                     continue
                 block_item = self.get_block_item_from_instance(external_port.block)
                 if block_item is None:
@@ -404,8 +406,11 @@ class DiagramView(QGraphicsView):
                     continue
                 wire = ManualBoundaryWireItem(
                     self,
-                    boundary_item.connection_anchor,
+                    lambda item=group_item, port=boundary: item.boundary_anchor_for(port),
                     port_item.connection_anchor,
+                    group_uid=group.uid,
+                    boundary_uid=boundary.uid,
+                    side="external",
                 )
                 self.diagram_scene.addItem(wire)
                 self.manual_boundary_wires[f"{boundary.uid}:external"] = wire
@@ -917,6 +922,13 @@ class DiagramView(QGraphicsView):
             self._cancel_temp_connection()
             return
 
+        if self.project_controller.try_connect_boundary_ports(
+            self.pending_port.instance,
+            target.instance,
+        ):
+            self._cancel_temp_connection()
+            return
+
         self.project_controller.add_connection(self.pending_port.instance, target.instance)
         self._cancel_temp_connection()
 
@@ -1019,6 +1031,12 @@ class DiagramView(QGraphicsView):
                     self.project_controller.delete_group(item.group.uid)
                 elif isinstance(item, BlockItem):
                     self.project_controller.remove_block(item.instance)
+                elif isinstance(item, ManualBoundaryWireItem):
+                    self.project_controller.disconnect_manual_boundary_side(
+                        item.group_uid,
+                        item.boundary_uid,
+                        item.side,
+                    )
                 elif isinstance(item, ConnectionItem):
                     self.project_controller.remove_connection(item.instance)
         finally:

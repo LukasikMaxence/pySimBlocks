@@ -156,14 +156,47 @@ class GroupItem(QGraphicsRectItem):
         self.setZValue(-1)
         self.sync_boundary_ports()
 
+    def _border_boundary_ports(self) -> list[BoundaryPort]:
+        """Return boundary ports that should appear on the group rectangle."""
+        return list(self.group.boundary_ports)
+
+    def boundary_anchor_for(self, boundary: BoundaryPort) -> QPointF:
+        """Return the scene anchor for a boundary port on this group."""
+        port_item = self.boundary_port_items.get(boundary.uid)
+        if port_item is not None:
+            return port_item.connection_anchor()
+        return self._boundary_anchor_from_geometry(boundary)
+
+    def _boundary_anchor_from_geometry(self, boundary: BoundaryPort) -> QPointF:
+        """Compute a boundary anchor when no border port item is shown."""
+        rect = self.rect()
+        same_direction = [
+            port
+            for port in self._border_boundary_ports()
+            if port.direction == boundary.direction
+        ]
+        if boundary not in same_direction:
+            same_direction = [
+                port for port in self.group.boundary_ports if port.direction == boundary.direction
+            ]
+        index = same_direction.index(boundary) if boundary in same_direction else 0
+        total = len(same_direction)
+        y = rect.height() * (index + 1) / (total + 1)
+        if boundary.direction == "input":
+            local = QPointF(-GroupBoundaryPortItem.R, y)
+        else:
+            local = QPointF(rect.width() + GroupBoundaryPortItem.L, y)
+        return self.mapToScene(local)
+
     def sync_boundary_ports(self) -> None:
         """Rebuild boundary port items from group metadata."""
         for item in list(self.boundary_port_items.values()):
             item.setParentItem(None)
         self.boundary_port_items.clear()
 
-        inputs = [p for p in self.group.boundary_ports if p.direction == "input"]
-        outputs = [p for p in self.group.boundary_ports if p.direction == "output"]
+        border_ports = self._border_boundary_ports()
+        inputs = [p for p in border_ports if p.direction == "input"]
+        outputs = [p for p in border_ports if p.direction == "output"]
         rect = self.rect()
 
         for index, boundary in enumerate(inputs):
@@ -186,10 +219,13 @@ class GroupItem(QGraphicsRectItem):
             item.update_port_label()
 
     def get_boundary_anchor(self, boundary_uid: str) -> QPointF | None:
-        port_item = self.boundary_port_items.get(boundary_uid)
-        if port_item is None:
+        boundary = next(
+            (port for port in self.group.boundary_ports if port.uid == boundary_uid),
+            None,
+        )
+        if boundary is None:
             return None
-        return port_item.connection_anchor()
+        return self.boundary_anchor_for(boundary)
 
     def find_boundary_for_member_port(self, block_uid: str, port_name: str) -> str | None:
         key = f"{block_uid}:{port_name}"

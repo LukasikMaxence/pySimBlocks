@@ -20,8 +20,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import copy
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from PySide6.QtCore import QObject, Signal, QPointF, QRectF
@@ -364,10 +365,21 @@ class ProjectController(QObject):
         return True
 
     def try_wire_boundary_endpoints(self, src, dst) -> bool:
-        """Wire a manual boundary from a proxy or group port to a block port."""
+        """Wire group boundaries, proxies, or group-to-group borders."""
         from pySimBlocks.gui.graphics.group_item import GroupBoundaryPortItem
         from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyPortItem
         from pySimBlocks.gui.graphics.port_item import PortItem
+
+        boundary_ports = [
+            endpoint
+            for endpoint in (src, dst)
+            if isinstance(endpoint, GroupBoundaryPortItem)
+        ]
+        if len(boundary_ports) == 2:
+            return self._wire_group_boundaries_together(
+                boundary_ports[0],
+                boundary_ports[1],
+            )
 
         proxy_port = None
         boundary_port = None
@@ -402,6 +414,42 @@ class ProjectController(QObject):
                 member_port,
             )
         return False
+
+    def _wire_group_boundaries_together(
+        self,
+        port_a,
+        port_b,
+    ) -> bool:
+        """Connect two group border ports across different groups."""
+        group_a = port_a.parent_group.group
+        group_b = port_b.parent_group.group
+        if group_a.uid == group_b.uid:
+            return False
+
+        boundary_a = port_a.boundary
+        boundary_b = port_b.boundary
+        member_a = find_port(self.project_state, boundary_a.linked_port_uid)
+        member_b = find_port(self.project_state, boundary_b.linked_port_uid)
+        if member_a is None or member_b is None:
+            return False
+
+        if boundary_a.direction == "output" and boundary_b.direction == "input":
+            src_port, dst_port = member_a, member_b
+        elif boundary_a.direction == "input" and boundary_b.direction == "output":
+            src_port, dst_port = member_b, member_a
+        else:
+            return False
+
+        if not src_port.is_compatible(dst_port):
+            return False
+        dst_connections = self.project_state.get_connections_of_port(dst_port)
+        if not dst_port.can_accept_connection(dst_connections):
+            return False
+
+        from pySimBlocks.gui.undo_redo.commands import AddConnectionCommand
+
+        self.undo_manager.push(AddConnectionCommand(self, src_port, dst_port, None))
+        return True
 
     def _wire_manual_boundary_internal(
         self,
@@ -641,6 +689,93 @@ class ProjectController(QObject):
     # Connection methods
     # --------------------------------------------------------------------------
 
+    def try_connect_boundary_ports(
+        self,
+        port1: PortInstance,
+        port2: PortInstance,
+    ) -> bool:
+        """Complete or wire a manual group boundary instead of a direct connection."""
+        if port1 is port2:
+            return False
+
+        src_group = self._group_containing_member(port1.block.uid)
+        dst_group = self._group_containing_member(port2.block.uid)
+        if (
+            src_group is not None
+            and dst_group is not None
+            and src_group.uid != dst_group.uid
+        ):
+            return False
+
+        for group in self.project_state.visual_groups:
+            members = set(self._group_content_uids_for_group(group))
+            for boundary in group.boundary_ports:
+                if boundary.origin != "manual" or boundary.linked_connection_uid:
+                    continue
+
+                internal = (
+                    find_port(self.project_state, boundary.linked_port_uid)
+                    if boundary.linked_port_uid
+                    else None
+                )
+                external = (
+                    find_port(self.project_state, boundary.external_port_uid)
+                    if boundary.external_port_uid
+                    else None
+                )
+                ports = {port1, port2}
+
+                if (
+                    internal is not None
+                    and external is not None
+                    and ports == {internal, external}
+                ):
+                    return self._complete_manual_boundary(group.uid, boundary.uid)
+
+                if internal is not None and internal in ports:
+                    external_candidate = port2 if port1 is internal else port1
+                    if validate_external_link(group, boundary, external_candidate):
+                        return self._wire_manual_boundary_external(
+                            group.uid,
+                            boundary.uid,
+                            external_candidate,
+                        )
+
+                if external is not None and external in ports:
+                    internal_candidate = port2 if port1 is external else port1
+                    if validate_internal_link(group, boundary, internal_candidate):
+                        return self._wire_manual_boundary_internal(
+                            group.uid,
+                            boundary.uid,
+                            internal_candidate,
+                        )
+        return False
+
+    def _complete_manual_boundary(self, group_uid: str, boundary_uid: str) -> bool:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None or not can_complete(self.project_state, boundary):
+            return False
+        before = self._capture_boundary_wire_snapshot(group_uid, boundary_uid)
+        wiring = capture_wiring_state(boundary)
+        connection_snapshot = self._connection_snapshot_for_wiring(
+            group, boundary, wiring
+        )
+        if connection_snapshot is None:
+            return False
+        self.undo_manager.push(
+            WireManualBoundaryCommand(
+                self,
+                group_uid,
+                boundary_uid,
+                before,
+                (wiring, connection_snapshot),
+            )
+        )
+        return True
+
     def add_connection(
         self,
         port1: PortInstance,
@@ -658,6 +793,8 @@ class ProjectController(QObject):
             port2: Second port (input or output).
             points: Optional list of intermediate waypoints for the wire.
         """
+        if self.try_connect_boundary_ports(port1, port2):
+            return
         if not port1.is_compatible(port2):
             return
         src_port, dst_port = (
@@ -1046,10 +1183,119 @@ class ProjectController(QObject):
         refresh_boundaries: bool = True,
     ) -> None:
         block_uids = {connection.src_block().uid, connection.dst_block().uid}
+        self._preserve_boundaries_on_connection_remove(connection)
         self.project_state.remove_connection(connection)
         self.view.remove_connection(connection)
         if refresh_boundaries:
             self._refresh_boundaries_for_member_uids(block_uids)
+
+    def _capture_boundaries_for_connection(
+        self,
+        connection: ConnectionInstance,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Snapshot group boundaries tied to a diagram connection (for undo)."""
+        key = self._connection_key(connection)
+        captured: list[tuple[str, dict[str, Any]]] = []
+        seen: set[tuple[str, str]] = set()
+        for group in self.project_state.visual_groups:
+            for boundary in group.boundary_ports:
+                linked = find_connection_for_boundary(self.project_state, boundary)
+                if linked is not connection and boundary.linked_connection_uid != key:
+                    continue
+                item = (group.uid, boundary.uid)
+                if item in seen:
+                    continue
+                seen.add(item)
+                captured.append((group.uid, copy.deepcopy(boundary.to_dict())))
+        return captured
+
+    def _preserve_boundaries_on_connection_remove(
+        self,
+        connection: ConnectionInstance,
+    ) -> None:
+        """Keep boundary proxies wired but mark affected boundaries incomplete."""
+        key = self._connection_key(connection)
+        src_uid = connection.src_block().uid
+        dst_uid = connection.dst_block().uid
+        changed = False
+
+        for group in self.project_state.visual_groups:
+            members = set(self._group_content_uids_for_group(group))
+            src_in = src_uid in members
+            dst_in = dst_uid in members
+            if src_in == dst_in:
+                continue
+
+            internal_port = connection.dst_port if dst_in else connection.src_port
+            external_port = connection.src_port if dst_in else connection.dst_port
+            internal_key = port_key(internal_port)
+            external_key = port_key(external_port)
+
+            boundary = next(
+                (
+                    port
+                    for port in group.boundary_ports
+                    if port.linked_connection_uid == key
+                    or (
+                        port.linked_port_uid == internal_key
+                        and find_connection_for_boundary(self.project_state, port)
+                        is connection
+                    )
+                ),
+                None,
+            )
+            if boundary is None:
+                continue
+
+            external_group = self._group_containing_member(external_port.block.uid)
+            is_cross_group = (
+                external_group is not None and external_group.uid != group.uid
+            )
+
+            if is_cross_group:
+                boundary.linked_connection_uid = ""
+                if boundary.origin == "manual" and boundary.external_port_uid == external_key:
+                    boundary.external_port_uid = ""
+                changed = True
+                continue
+
+            if boundary.origin == "manual":
+                boundary.linked_connection_uid = ""
+                if not boundary.linked_port_uid:
+                    boundary.linked_port_uid = internal_key
+                if not boundary.external_port_uid:
+                    boundary.external_port_uid = external_key
+            else:
+                boundary.origin = "manual"
+                boundary.linked_port_uid = internal_key
+                boundary.external_port_uid = external_key
+                boundary.linked_connection_uid = ""
+
+            self.ensure_group_boundary_proxies(group)
+            changed = True
+
+        if changed:
+            self.view.refresh_visual_groups()
+
+    def _restore_boundary_snapshots(
+        self,
+        snapshots: list[tuple[str, dict[str, Any]]],
+    ) -> None:
+        for group_uid, boundary_dict in snapshots:
+            group = self.project_state.get_visual_group(group_uid)
+            if group is None:
+                continue
+            restored = BoundaryPort.from_dict(boundary_dict)
+            replaced = False
+            for index, boundary in enumerate(group.boundary_ports):
+                if boundary.uid == restored.uid:
+                    group.boundary_ports[index] = restored
+                    replaced = True
+                    break
+            if not replaced:
+                group.boundary_ports.append(restored)
+            self.ensure_group_boundary_proxies(group)
+        self.view.refresh_visual_groups()
 
     def _find_block_by_uid(self, block_uid: str) -> BlockInstance | None:
         for block in self.project_state.blocks:
@@ -1689,6 +1935,44 @@ class ProjectController(QObject):
         )
         return True
 
+    def disconnect_manual_boundary_side(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        side: str,
+    ) -> bool:
+        """Disconnect one side of an incomplete manual boundary wire (undoable)."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None or boundary.origin != "manual":
+            return False
+        if side not in ("internal", "external"):
+            return False
+
+        before = self._capture_boundary_wire_snapshot(group_uid, boundary_uid)
+        after_wiring = capture_wiring_state(boundary)
+        if side == "internal":
+            if not after_wiring.linked_port_uid:
+                return False
+            after_wiring.linked_port_uid = ""
+        else:
+            if not after_wiring.external_port_uid:
+                return False
+            after_wiring.external_port_uid = ""
+        after_wiring.linked_connection_uid = ""
+        self.undo_manager.push(
+            WireManualBoundaryCommand(
+                self,
+                group_uid,
+                boundary_uid,
+                before,
+                (after_wiring, None),
+            )
+        )
+        return True
+
     def remove_manual_boundary_port(self, group_uid: str, boundary_uid: str) -> bool:
         """Remove a manual GroupIn/GroupOut boundary port (undoable)."""
         return self.remove_boundary_port(group_uid, boundary_uid)
@@ -1825,6 +2109,18 @@ class ProjectController(QObject):
                 port.uid = previous.uid
                 port.proxy_uid = previous.proxy_uid
                 port.proxy_layout = dict(previous.proxy_layout)
+            rebuilt_auto.append(port)
+
+        rebuilt_keys = {port.linked_port_uid for port in rebuilt_auto}
+        for port in group.boundary_ports:
+            if port.origin != "auto":
+                continue
+            if not port.linked_port_uid or port.linked_connection_uid:
+                continue
+            if port.linked_port_uid in manual_member_keys:
+                continue
+            if port.linked_port_uid in rebuilt_keys:
+                continue
             rebuilt_auto.append(port)
 
         group.boundary_ports = manual_ports + rebuilt_auto
