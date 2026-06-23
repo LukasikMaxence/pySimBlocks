@@ -411,9 +411,23 @@ class ProjectController(QObject):
             group_uid = self.view.current_view_group_uid
             if group_uid is None:
                 return False
+            boundary_uid = proxy_port.parent_proxy.boundary.uid
+            group = self.project_state.get_visual_group(group_uid)
+            boundary = (
+                self._find_boundary_port(group, boundary_uid) if group is not None else None
+            )
+            if (
+                boundary is not None
+                and boundary.origin == "auto"
+                and not boundary.linked_connection_uid
+                and self._wire_auto_boundary_internal(
+                    group_uid, boundary_uid, member_port
+                )
+            ):
+                return True
             return self._wire_manual_boundary_internal(
                 group_uid,
-                proxy_port.parent_proxy.boundary.uid,
+                boundary_uid,
                 member_port,
             )
 
@@ -540,6 +554,38 @@ class ProjectController(QObject):
             boundary_uid,
             member_port,
         )
+
+    def _wire_auto_boundary_internal(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        member_port: PortInstance,
+    ) -> bool:
+        """Restore an auto boundary by wiring its proxy to the member port."""
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None or boundary.origin != "auto" or boundary.linked_connection_uid:
+            return False
+        if not self._validate_internal_link(group, boundary, member_port):
+            return False
+        if not boundary.external_port_uid:
+            return False
+        external = find_port(self.project_state, boundary.external_port_uid)
+        if external is None:
+            return False
+        if boundary.direction == "input":
+            src_port, dst_port = external, member_port
+        else:
+            src_port, dst_port = member_port, external
+        if not src_port.is_compatible(dst_port):
+            return False
+        dst_connections = self.project_state.get_connections_of_port(dst_port)
+        if not dst_port.can_accept_connection(dst_connections):
+            return False
+        self.undo_manager.push(AddConnectionCommand(self, src_port, dst_port, None))
+        return True
 
     def _validate_auto_external_link(
         self,
@@ -848,6 +894,21 @@ class ProjectController(QObject):
                                 group.uid,
                                 boundary.uid,
                                 external_candidate,
+                            )
+                    external = (
+                        find_port(self.project_state, boundary.external_port_uid)
+                        if boundary.external_port_uid
+                        else None
+                    )
+                    if external is not None and external in ports:
+                        internal_candidate = port2 if port1 is external else port1
+                        if self._validate_internal_link(
+                            group, boundary, internal_candidate
+                        ):
+                            return self._wire_auto_boundary_internal(
+                                group.uid,
+                                boundary.uid,
+                                internal_candidate,
                             )
                     continue
 
@@ -1399,10 +1460,13 @@ class ProjectController(QObject):
                 boundary.linked_connection_uid = ""
                 if boundary.origin == "manual" and boundary.external_port_uid == external_key:
                     boundary.external_port_uid = ""
+                elif boundary.origin != "manual":
+                    boundary.external_port_uid = external_key
                 changed = True
                 continue
 
             if external_at_root and boundary.origin != "manual":
+                boundary.external_port_uid = external_key
                 boundary.linked_connection_uid = ""
                 changed = True
                 continue
