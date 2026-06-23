@@ -38,10 +38,14 @@ from pySimBlocks.gui.models import (
 from pySimBlocks.gui.diagram_clipboard import (
     DiagramClipboard,
     capture_selection_clipboard,
+    clipboard_has_content,
     paste_clipboard,
     undo_paste,
 )
-from pySimBlocks.gui.group_boundary_labels import boundary_port_label
+from pySimBlocks.gui.group_boundary_labels import (
+    boundary_port_label,
+    manual_boundary_display_label,
+)
 from pySimBlocks.gui.services.group_boundary_service import (
     BoundaryWiringState,
     apply_wiring_state,
@@ -50,6 +54,7 @@ from pySimBlocks.gui.services.group_boundary_service import (
     connection_endpoints,
     find_connection_for_boundary,
     find_port,
+    is_complete,
     port_key,
     validate_external_link,
     validate_internal_link,
@@ -179,7 +184,9 @@ class ProjectController(QObject):
     def paste_clipboard_at(self, origin: QPointF) -> bool:
         """Paste the view clipboard at ``origin`` (undoable)."""
         clipboard = self.view.clipboard
-        if clipboard is None or not clipboard.blocks:
+        if not clipboard_has_content(clipboard):
+            return False
+        if clipboard.boundary_ports and self.view.current_view_group_uid is None:
             return False
         parent_uid = self.view.current_view_group_uid
         self.undo_manager.push(
@@ -392,6 +399,9 @@ class ProjectController(QObject):
             elif isinstance(endpoint, PortItem):
                 block_port_item = endpoint
 
+        if proxy_port is not None and boundary_port is not None:
+            return self._wire_proxy_to_child_group_border(proxy_port, boundary_port)
+
         if block_port_item is None:
             return False
 
@@ -408,9 +418,15 @@ class ProjectController(QObject):
             )
 
         if boundary_port is not None:
+            group_uid = boundary_port.parent_group.group.uid
+            boundary_uid = boundary_port.boundary.uid
+            if self._wire_auto_boundary_external(
+                group_uid, boundary_uid, member_port
+            ):
+                return True
             return self._wire_manual_boundary_external(
-                boundary_port.parent_group.group.uid,
-                boundary_port.boundary.uid,
+                group_uid,
+                boundary_uid,
                 member_port,
             )
         return False
@@ -461,7 +477,9 @@ class ProjectController(QObject):
         if group is None:
             return False
         boundary = self._find_boundary_port(group, boundary_uid)
-        if boundary is None or not validate_internal_link(group, boundary, member_port):
+        if boundary is None or not self._validate_internal_link(
+            group, boundary, member_port
+        ):
             return False
         before = self._capture_boundary_wire_snapshot(group_uid, boundary_uid)
         after_wiring = capture_wiring_state(boundary)
@@ -473,6 +491,108 @@ class ProjectController(QObject):
         self.undo_manager.push(
             WireManualBoundaryCommand(self, group_uid, boundary_uid, before, after)
         )
+        return True
+
+    def _validate_internal_link(
+        self,
+        group: VisualGroup,
+        boundary: BoundaryPort,
+        member_port: PortInstance,
+    ) -> bool:
+        """Validate an internal boundary link against the full group content."""
+        content_uids = set(self._group_content_uids_for_group(group))
+        return validate_internal_link(
+            group,
+            boundary,
+            member_port,
+            content_uids=content_uids,
+        )
+
+    def _wire_proxy_to_child_group_border(
+        self,
+        proxy_port,
+        child_boundary_port,
+    ) -> bool:
+        """Wire a parent-group proxy to a child group's border port."""
+        active_uid = self.view.current_view_group_uid
+        if active_uid is None:
+            return False
+
+        parent_group = self.project_state.get_visual_group(active_uid)
+        child_group = child_boundary_port.parent_group.group
+        if parent_group is None or child_group.uid not in parent_group.child_group_uids:
+            return False
+
+        boundary_uid = proxy_port.parent_proxy.boundary.uid
+        boundary = self._find_boundary_port(parent_group, boundary_uid)
+        if boundary is None:
+            return False
+
+        member_port = find_port(
+            self.project_state,
+            child_boundary_port.boundary.linked_port_uid,
+        )
+        if member_port is None:
+            return False
+
+        return self._wire_manual_boundary_internal(
+            active_uid,
+            boundary_uid,
+            member_port,
+        )
+
+    def _validate_auto_external_link(
+        self,
+        group: VisualGroup,
+        boundary: BoundaryPort,
+        external_port: PortInstance,
+    ) -> PortInstance | None:
+        """Return the internal port when an incomplete auto boundary may be rewired."""
+        if boundary.origin != "auto" or boundary.linked_connection_uid:
+            return None
+        if not boundary.linked_port_uid:
+            return None
+        internal = find_port(self.project_state, boundary.linked_port_uid)
+        if internal is None:
+            return None
+        members = set(self._group_content_uids_for_group(group))
+        if external_port.block.uid in members:
+            return None
+        if boundary.direction == "input":
+            if external_port.direction != "output" or internal.direction != "input":
+                return None
+            src_port, dst_port = external_port, internal
+        else:
+            if external_port.direction != "input" or internal.direction != "output":
+                return None
+            src_port, dst_port = internal, external_port
+        if not src_port.is_compatible(dst_port):
+            return None
+        dst_connections = self.project_state.get_connections_of_port(dst_port)
+        if not dst_port.can_accept_connection(dst_connections):
+            return None
+        return internal
+
+    def _wire_auto_boundary_external(
+        self,
+        group_uid: str,
+        boundary_uid: str,
+        external_port: PortInstance,
+    ) -> bool:
+        group = self.project_state.get_visual_group(group_uid)
+        if group is None:
+            return False
+        boundary = self._find_boundary_port(group, boundary_uid)
+        if boundary is None:
+            return False
+        internal = self._validate_auto_external_link(group, boundary, external_port)
+        if internal is None:
+            return False
+        if boundary.direction == "input":
+            src_port, dst_port = external_port, internal
+        else:
+            src_port, dst_port = internal, external_port
+        self.undo_manager.push(AddConnectionCommand(self, src_port, dst_port, None))
         return True
 
     def _wire_manual_boundary_external(
@@ -596,7 +716,9 @@ class ProjectController(QObject):
         return boundary_port_label(self.project_state, group, boundary)
 
     def boundary_proxy_label(self, boundary: BoundaryPort) -> str:
-        """Return proxy label: manual override, else linked internal port."""
+        """Return the label drawn on a GroupIn/GroupOut proxy."""
+        if boundary.origin == "manual":
+            return manual_boundary_display_label(boundary)
         if boundary.label.strip():
             return boundary.label.strip()
         linked = find_port(self.project_state, boundary.linked_port_uid)
@@ -707,9 +829,28 @@ class ProjectController(QObject):
         ):
             return False
 
+        ports = {port1, port2}
         for group in self.project_state.visual_groups:
             members = set(self._group_content_uids_for_group(group))
             for boundary in group.boundary_ports:
+                if boundary.origin == "auto" and not boundary.linked_connection_uid:
+                    internal = (
+                        find_port(self.project_state, boundary.linked_port_uid)
+                        if boundary.linked_port_uid
+                        else None
+                    )
+                    if internal is not None and internal in ports:
+                        external_candidate = port2 if port1 is internal else port1
+                        if self._validate_auto_external_link(
+                            group, boundary, external_candidate
+                        ) is not None:
+                            return self._wire_auto_boundary_external(
+                                group.uid,
+                                boundary.uid,
+                                external_candidate,
+                            )
+                    continue
+
                 if boundary.origin != "manual" or boundary.linked_connection_uid:
                     continue
 
@@ -723,7 +864,6 @@ class ProjectController(QObject):
                     if boundary.external_port_uid
                     else None
                 )
-                ports = {port1, port2}
 
                 if (
                     internal is not None
@@ -743,7 +883,9 @@ class ProjectController(QObject):
 
                 if external is not None and external in ports:
                     internal_candidate = port2 if port1 is external else port1
-                    if validate_internal_link(group, boundary, internal_candidate):
+                    if self._validate_internal_link(
+                        group, boundary, internal_candidate
+                    ):
                         return self._wire_manual_boundary_internal(
                             group.uid,
                             boundary.uid,
@@ -1251,11 +1393,17 @@ class ProjectController(QObject):
             is_cross_group = (
                 external_group is not None and external_group.uid != group.uid
             )
+            external_at_root = external_group is None
 
             if is_cross_group:
                 boundary.linked_connection_uid = ""
                 if boundary.origin == "manual" and boundary.external_port_uid == external_key:
                     boundary.external_port_uid = ""
+                changed = True
+                continue
+
+            if external_at_root and boundary.origin != "manual":
+                boundary.linked_connection_uid = ""
                 changed = True
                 continue
 
@@ -1899,8 +2047,42 @@ class ProjectController(QObject):
         boundary = self._find_boundary_port(group, boundary_uid)
         if boundary is None:
             return
-        boundary.label = label.strip()
+        trimmed = label.strip()
+        if not trimmed and boundary.origin == "manual":
+            trimmed = self._make_unique_boundary_label(
+                group,
+                boundary.direction,
+                exclude_uid=boundary_uid,
+            )
+        boundary.label = trimmed
         self.view.refresh_visual_groups()
+
+    def _proxy_default_label(self, direction: str) -> str:
+        return "In" if direction == "input" else "Out"
+
+    def _make_unique_boundary_label(
+        self,
+        group: VisualGroup,
+        direction: str,
+        *,
+        exclude_uid: str | None = None,
+    ) -> str:
+        """Return a unique default GroupIn/GroupOut name inside one group."""
+        base = self._proxy_default_label(direction)
+        used: set[str] = set()
+        for port in group.boundary_ports:
+            if port.uid == exclude_uid or port.origin != "manual":
+                continue
+            if port.direction != direction:
+                continue
+            name = port.label.strip() or self._proxy_default_label(port.direction)
+            used.add(name)
+        if base not in used:
+            return base
+        index = 1
+        while f"{base}_{index}" in used:
+            index += 1
+        return f"{base}_{index}"
 
     def add_manual_boundary_port(
         self,
@@ -1916,6 +2098,7 @@ class ProjectController(QObject):
             uid=uuid.uuid4().hex,
             direction=direction,
             origin="manual",
+            label=self._make_unique_boundary_label(group, direction),
             proxy_uid=uuid.uuid4().hex,
             proxy_layout={"x": float(pos.x()), "y": float(pos.y())},
         )
@@ -1946,7 +2129,7 @@ class ProjectController(QObject):
         if group is None:
             return False
         boundary = self._find_boundary_port(group, boundary_uid)
-        if boundary is None or boundary.origin != "manual":
+        if boundary is None or is_complete(boundary):
             return False
         if side not in ("internal", "external"):
             return False
@@ -2123,6 +2306,19 @@ class ProjectController(QObject):
                 continue
             rebuilt_auto.append(port)
 
+        previous_auto_order = [
+            port.linked_port_uid
+            for port in group.boundary_ports
+            if port.origin == "auto" and port.linked_port_uid
+        ]
+
+        def _auto_boundary_order(port: BoundaryPort) -> tuple[int, str]:
+            try:
+                return (previous_auto_order.index(port.linked_port_uid), port.uid)
+            except ValueError:
+                return (len(previous_auto_order), port.linked_port_uid or port.uid)
+
+        rebuilt_auto.sort(key=_auto_boundary_order)
         group.boundary_ports = manual_ports + rebuilt_auto
         self.ensure_group_boundary_proxies(group)
 

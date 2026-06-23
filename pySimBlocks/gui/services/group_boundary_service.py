@@ -77,11 +77,14 @@ def validate_internal_link(
     group: VisualGroup,
     boundary: BoundaryPort,
     member_port: PortInstance,
+    *,
+    content_uids: set[str] | None = None,
 ) -> bool:
-    """Return whether a member port may be wired to a manual boundary proxy."""
-    if not is_manual(boundary):
+    """Return whether a member port may be wired to a boundary proxy."""
+    if is_complete(boundary):
         return False
-    if member_port.block.uid not in group.members:
+    scope = content_uids if content_uids is not None else set(group.members)
+    if member_port.block.uid not in scope:
         return False
     if boundary.direction == "input" and member_port.direction != "input":
         return False

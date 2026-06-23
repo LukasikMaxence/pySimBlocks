@@ -28,7 +28,7 @@ from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QInputDialog, QMenu
 
 from pySimBlocks.gui.graphics.block_item import BlockItem
 from pySimBlocks.gui.graphics.group_item import GroupBoundaryPortItem, GroupItem
-from pySimBlocks.gui.diagram_clipboard import DiagramClipboard
+from pySimBlocks.gui.diagram_clipboard import DiagramClipboard, clipboard_has_content
 from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyItem, GroupProxyPortItem
 from pySimBlocks.gui.graphics.connection_item import ConnectionItem, OrthogonalRoute
 from pySimBlocks.gui.graphics.manual_boundary_wire_item import ManualBoundaryWireItem
@@ -344,7 +344,7 @@ class DiagramView(QGraphicsView):
         self.refresh_manual_boundary_wires()
 
     def refresh_manual_boundary_wires(self) -> None:
-        """Rebuild visual-only wires for incomplete manual group boundaries."""
+        """Rebuild visual-only wires for incomplete group boundaries."""
         for wire in self.manual_boundary_wires.values():
             self.diagram_scene.removeItem(wire)
         self.manual_boundary_wires.clear()
@@ -360,24 +360,46 @@ class DiagramView(QGraphicsView):
             if group is None:
                 return
             for boundary in group.boundary_ports:
-                if boundary.origin != "manual" or boundary.linked_connection_uid:
+                if boundary.linked_connection_uid:
                     continue
                 if not boundary.linked_port_uid:
                     continue
-                proxy = self.proxy_items.get(boundary.uid)
+                if not self._proxy_applies_to_active_group(group, boundary):
+                    continue
                 member_port = find_port(state, boundary.linked_port_uid)
-                if proxy is None or member_port is None:
+                if member_port is None:
                     continue
-                block_item = self.get_block_item_from_instance(member_port.block)
-                if block_item is None:
+                proxy = self.proxy_items.get(boundary.uid)
+                if proxy is None:
                     continue
-                port_item = block_item.get_port_item(member_port.name)
-                if port_item is None:
-                    continue
+                child_uid = (
+                    self._child_group_uid_for_block(group, member_port.block.uid)
+                    if group.child_group_uids
+                    else None
+                )
+                if child_uid is not None:
+                    child_item = self.group_items.get(child_uid)
+                    if child_item is None:
+                        continue
+                    boundary_uid = child_item.find_boundary_for_member_port(
+                        member_port.block.uid,
+                        member_port.name,
+                    )
+                    if boundary_uid is None:
+                        continue
+                    member_anchor = lambda item=child_item, uid=boundary_uid: item.get_boundary_anchor(uid)
+                else:
+                    block_item = self.get_block_item_from_instance(member_port.block)
+                    if block_item is None:
+                        continue
+                    port_item = block_item.get_port_item(member_port.name)
+                    if port_item is None:
+                        continue
+                    member_anchor = port_item.connection_anchor
                 wire = ManualBoundaryWireItem(
                     self,
                     proxy.member_anchor,
-                    port_item.connection_anchor,
+                    member_anchor,
                     group_uid=active_uid,
                     boundary_uid=boundary.uid,
                     side="internal",
@@ -387,8 +409,10 @@ class DiagramView(QGraphicsView):
             return
 
         for group in state.visual_groups:
+            if group.parent_uid is not None:
+                continue
             group_item = self.group_items.get(group.uid)
-            if group_item is None:
+            if group_item is None or not group_item.isVisible():
                 continue
             for boundary in group.boundary_ports:
                 if boundary.origin != "manual" or boundary.linked_connection_uid:
@@ -399,7 +423,7 @@ class DiagramView(QGraphicsView):
                 if external_port is None:
                     continue
                 block_item = self.get_block_item_from_instance(external_port.block)
-                if block_item is None:
+                if block_item is None or not block_item.isVisible():
                     continue
                 port_item = block_item.get_port_item(external_port.name)
                 if port_item is None:
@@ -422,6 +446,21 @@ class DiagramView(QGraphicsView):
         for proxy_item in self.proxy_items.values():
             proxy_item.update()
 
+    def _proxy_applies_to_active_group(
+        self,
+        group,
+        boundary,
+    ) -> bool:
+        """Return whether a proxy belongs to the current internal group view."""
+        if not boundary.linked_port_uid:
+            return True
+        block_uid = boundary.linked_port_uid.split(":", 1)[0]
+        if block_uid in group.members:
+            return True
+        if group.child_group_uids:
+            return self._child_group_uid_for_block(group, block_uid) is not None
+        return False
+
     def _refresh_group_proxies(self, active_group) -> None:
         """Create or hide GroupIn/GroupOut proxy items for the active internal view."""
         if active_group is None:
@@ -429,13 +468,19 @@ class DiagramView(QGraphicsView):
                 item.setVisible(False)
             return
 
-        active_boundary_uids = {boundary.uid for boundary in active_group.boundary_ports}
+        active_boundary_uids = {
+            boundary.uid
+            for boundary in active_group.boundary_ports
+            if self._proxy_applies_to_active_group(active_group, boundary)
+        }
         for uid in list(self.proxy_items.keys()):
             if uid not in active_boundary_uids:
                 item = self.proxy_items.pop(uid)
                 self.diagram_scene.removeItem(item)
 
         for boundary in active_group.boundary_ports:
+            if not self._proxy_applies_to_active_group(active_group, boundary):
+                continue
             item = self.proxy_items.get(boundary.uid)
             if item is None:
                 item = GroupProxyItem(boundary, self)
@@ -558,10 +603,10 @@ class DiagramView(QGraphicsView):
         return port_item.connection_anchor()
 
     def _manual_proxy_anchor_for_member_port(self, group, port_item: PortItem) -> QPointF | None:
-        """Route member ports to a manual proxy while the boundary is incomplete."""
+        """Route member ports to a proxy while the boundary is incomplete."""
         key = f"{port_item.instance.block.uid}:{port_item.instance.name}"
         for boundary in group.boundary_ports:
-            if boundary.origin != "manual" or boundary.linked_connection_uid:
+            if boundary.linked_connection_uid:
                 continue
             if boundary.linked_port_uid != key:
                 continue
@@ -804,7 +849,7 @@ class DiagramView(QGraphicsView):
 
         # PASTE
         if event.key() == Qt.Key_V and event.modifiers() & Qt.ControlModifier:
-            if self.clipboard and self.clipboard.blocks:
+            if clipboard_has_content(self.clipboard):
                 offset = 30 * (self.paste_generation + 1)
                 origin = QPointF(
                     self.clipboard.anchor_x + offset,

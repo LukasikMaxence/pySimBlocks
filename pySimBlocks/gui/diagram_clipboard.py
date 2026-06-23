@@ -34,6 +34,18 @@ class ClipboardBlock:
 
 
 @dataclass
+class ClipboardBoundaryPort:
+    """Serializable GroupIn/GroupOut proxy for copy/paste."""
+
+    source_uid: str
+    direction: str
+    label: str
+    layout: dict[str, Any]
+    linked_port_uid: str = ""
+    external_port_uid: str = ""
+
+
+@dataclass
 class DiagramClipboard:
     """In-memory clipboard for diagram selections."""
 
@@ -41,8 +53,16 @@ class DiagramClipboard:
     connections: list[ConnectionSnapshot] = field(default_factory=list)
     groups: list[dict[str, Any]] = field(default_factory=list)
     root_group_uids: list[str] = field(default_factory=list)
+    boundary_ports: list[ClipboardBoundaryPort] = field(default_factory=list)
     anchor_x: float = 0.0
     anchor_y: float = 0.0
+
+
+def clipboard_has_content(clipboard: DiagramClipboard | None) -> bool:
+    """Return whether a clipboard carries pasteable diagram data."""
+    if clipboard is None:
+        return False
+    return bool(clipboard.blocks or clipboard.groups or clipboard.boundary_ports)
 
 
 @dataclass
@@ -52,6 +72,7 @@ class PasteResult:
     blocks: list[BlockInstance] = field(default_factory=list)
     connections: list = field(default_factory=list)
     group_uids: list[str] = field(default_factory=list)
+    boundary_ports: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _layout_anchor(layouts: list[dict[str, Any]]) -> tuple[float, float]:
@@ -312,6 +333,65 @@ def _capture_mixed_selection_clipboard(
     )
 
 
+def _selected_proxy_items(selected) -> list:
+    """Return unique GroupProxyItem instances from a scene selection."""
+    from pySimBlocks.gui.graphics.group_proxy_item import GroupProxyItem, GroupProxyPortItem
+
+    proxies: list[GroupProxyItem] = []
+    seen: set[str] = set()
+    for item in selected:
+        if isinstance(item, GroupProxyPortItem):
+            item = item.parent_proxy
+        if not isinstance(item, GroupProxyItem):
+            continue
+        if item.boundary.uid in seen:
+            continue
+        seen.add(item.boundary.uid)
+        proxies.append(item)
+    return proxies
+
+
+def capture_proxies_clipboard(
+    controller: ProjectController,
+    proxy_items: list,
+) -> DiagramClipboard | None:
+    """Capture selected GroupIn/GroupOut proxies from the active internal view."""
+    if not proxy_items or controller.view.current_view_group_uid is None:
+        return None
+
+    boundary_ports: list[ClipboardBoundaryPort] = []
+    layouts: list[dict[str, Any]] = []
+    for proxy in proxy_items:
+        boundary = proxy.boundary
+        layout = dict(boundary.proxy_layout) if boundary.proxy_layout else {
+            "x": float(proxy.pos().x()),
+            "y": float(proxy.pos().y()),
+        }
+        layouts.append(layout)
+        linked_port_uid = ""
+        external_port_uid = ""
+        if boundary.origin == "manual" and not boundary.linked_connection_uid:
+            linked_port_uid = boundary.linked_port_uid
+            external_port_uid = boundary.external_port_uid
+        boundary_ports.append(
+            ClipboardBoundaryPort(
+                source_uid=boundary.uid,
+                direction=boundary.direction,
+                label=boundary.label,
+                layout=layout,
+                linked_port_uid=linked_port_uid,
+                external_port_uid=external_port_uid,
+            )
+        )
+
+    anchor_x, anchor_y = _layout_anchor(layouts)
+    return DiagramClipboard(
+        boundary_ports=boundary_ports,
+        anchor_x=anchor_x,
+        anchor_y=anchor_y,
+    )
+
+
 def capture_selection_clipboard(controller: ProjectController) -> DiagramClipboard | None:
     """Capture the current diagram selection for copy."""
     from pySimBlocks.gui.graphics.block_item import BlockItem
@@ -320,18 +400,47 @@ def capture_selection_clipboard(controller: ProjectController) -> DiagramClipboa
     selected = controller.view.diagram_scene.selectedItems()
     groups = [item for item in selected if isinstance(item, GroupItem)]
     blocks = [item for item in selected if isinstance(item, BlockItem)]
+    proxies = _selected_proxy_items(selected)
 
     if groups and blocks:
-        return _capture_mixed_selection_clipboard(
+        clipboard = _capture_mixed_selection_clipboard(
             controller,
             [item.group.uid for item in groups],
             blocks,
         )
-    if groups:
-        return capture_groups_clipboard(controller, [item.group.uid for item in groups])
-    if blocks:
-        return capture_blocks_clipboard(controller, blocks)
-    return None
+    elif groups:
+        clipboard = capture_groups_clipboard(controller, [item.group.uid for item in groups])
+    elif blocks:
+        clipboard = capture_blocks_clipboard(controller, blocks)
+    elif proxies:
+        clipboard = capture_proxies_clipboard(controller, proxies)
+    else:
+        return None
+
+    if clipboard is None:
+        return None
+    if not proxies:
+        return clipboard
+
+    proxy_clipboard = capture_proxies_clipboard(controller, proxies)
+    if proxy_clipboard is None:
+        return clipboard
+
+    anchor_layouts = [
+        dict(port.layout) for port in proxy_clipboard.boundary_ports
+    ]
+    for block in clipboard.blocks:
+        anchor_layouts.append(dict(block.layout))
+    for root_uid in clipboard.root_group_uids:
+        root = controller.project_state.get_visual_group(root_uid)
+        if root is not None and root.layout:
+            anchor_layouts.append(dict(root.layout))
+
+    anchor_x, anchor_y = _layout_anchor(anchor_layouts)
+    clipboard.boundary_ports = proxy_clipboard.boundary_ports
+    clipboard.anchor_x = anchor_x
+    clipboard.anchor_y = anchor_y
+    return clipboard
 
 
 def _remap_connection(
@@ -407,6 +516,68 @@ def _duplicate_group(
     return group
 
 
+def _paste_boundary_label(
+    controller: ProjectController,
+    group: VisualGroup,
+    port_data: ClipboardBoundaryPort,
+) -> str:
+    """Choose a unique label for a pasted GroupIn/GroupOut."""
+    preferred = port_data.label.strip() or controller._proxy_default_label(port_data.direction)
+    used: set[str] = set()
+    for port in group.boundary_ports:
+        if port.origin != "manual" or port.direction != port_data.direction:
+            continue
+        name = port.label.strip() or controller._proxy_default_label(port.direction)
+        used.add(name)
+    if preferred not in used:
+        return preferred
+    index = 1
+    while f"{preferred}_{index}" in used:
+        index += 1
+    return f"{preferred}_{index}"
+
+
+def _paste_boundary_ports(
+    controller: ProjectController,
+    clipboard: DiagramClipboard,
+    origin: QPointF,
+    uid_map: dict[str, str],
+    *,
+    parent_group_uid: str | None,
+    result: PasteResult,
+) -> None:
+    """Create GroupIn/GroupOut proxies from clipboard boundary ports."""
+    if not clipboard.boundary_ports or parent_group_uid is None:
+        return
+
+    group = controller.project_state.get_visual_group(parent_group_uid)
+    if group is None:
+        return
+
+    dx = float(origin.x()) - clipboard.anchor_x
+    dy = float(origin.y()) - clipboard.anchor_y
+    for port_data in clipboard.boundary_ports:
+        layout = _offset_layout(dict(port_data.layout), dx, dy)
+        boundary = BoundaryPort(
+            uid=uuid.uuid4().hex,
+            direction=port_data.direction,
+            origin="manual",
+            label=_paste_boundary_label(controller, group, port_data),
+            proxy_uid=uuid.uuid4().hex,
+            proxy_layout=layout,
+        )
+        if port_data.linked_port_uid and ":" in port_data.linked_port_uid:
+            old_uid, port_name = port_data.linked_port_uid.split(":", 1)
+            if old_uid in uid_map:
+                boundary.linked_port_uid = f"{uid_map[old_uid]}:{port_name}"
+        if port_data.external_port_uid and ":" in port_data.external_port_uid:
+            old_uid, port_name = port_data.external_port_uid.split(":", 1)
+            if old_uid in uid_map:
+                boundary.external_port_uid = f"{uid_map[old_uid]}:{port_name}"
+        controller._add_manual_boundary_port(parent_group_uid, boundary)
+        result.boundary_ports.append((parent_group_uid, boundary.uid))
+
+
 def paste_clipboard(
     controller: ProjectController,
     clipboard: DiagramClipboard,
@@ -416,7 +587,7 @@ def paste_clipboard(
 ) -> PasteResult:
     """Paste clipboard contents at ``origin`` without pushing undo."""
     result = PasteResult()
-    if not clipboard.blocks and not clipboard.groups:
+    if not clipboard_has_content(clipboard):
         return result
 
     dx = float(origin.x()) - clipboard.anchor_x
@@ -487,12 +658,28 @@ def paste_clipboard(
             if parent_group_uid is not None:
                 controller._attach_group_to_parent(group)
 
+    target_group_uid = parent_group_uid
+    if target_group_uid is None and clipboard.boundary_ports:
+        target_group_uid = controller.view.current_view_group_uid
+
+    _paste_boundary_ports(
+        controller,
+        clipboard,
+        origin,
+        uid_map,
+        parent_group_uid=target_group_uid,
+        result=result,
+    )
+
     controller.view.refresh_visual_groups()
     return result
 
 
 def undo_paste(controller: ProjectController, result: PasteResult) -> None:
     """Remove entities created by a paste operation."""
+    for group_uid, boundary_uid in reversed(result.boundary_ports):
+        controller._remove_boundary_port(group_uid, boundary_uid)
+
     for group_uid in reversed(result.group_uids):
         if group_uid in controller.view.view_stack:
             controller.view.navigate_out_of_group(group_uid)

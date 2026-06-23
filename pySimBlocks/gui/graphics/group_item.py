@@ -167,17 +167,30 @@ class GroupItem(QGraphicsRectItem):
             return port_item.connection_anchor()
         return self._boundary_anchor_from_geometry(boundary)
 
+    def _boundaries_for_direction(self, direction: str) -> list[BoundaryPort]:
+        """Return border ports for one side in stable display order."""
+        previous_y = {
+            uid: float(item.pos().y())
+            for uid, item in self.boundary_port_items.items()
+        }
+        return sorted(
+            [
+                port
+                for port in self._border_boundary_ports()
+                if port.direction == direction
+            ],
+            key=lambda boundary: self._border_sort_key(boundary, previous_y),
+        )
+
     def _boundary_anchor_from_geometry(self, boundary: BoundaryPort) -> QPointF:
         """Compute a boundary anchor when no border port item is shown."""
         rect = self.rect()
-        same_direction = [
-            port
-            for port in self._border_boundary_ports()
-            if port.direction == boundary.direction
-        ]
+        same_direction = self._boundaries_for_direction(boundary.direction)
         if boundary not in same_direction:
             same_direction = [
-                port for port in self.group.boundary_ports if port.direction == boundary.direction
+                port
+                for port in self.group.boundary_ports
+                if port.direction == boundary.direction
             ]
         index = same_direction.index(boundary) if boundary in same_direction else 0
         total = len(same_direction)
@@ -188,15 +201,37 @@ class GroupItem(QGraphicsRectItem):
             local = QPointF(rect.width() + GroupBoundaryPortItem.L, y)
         return self.mapToScene(local)
 
+    def _border_sort_key(
+        self,
+        boundary: BoundaryPort,
+        previous_y: dict[str, float],
+    ) -> tuple[float, str]:
+        """Keep border ports in a stable vertical order across rebuilds."""
+        if boundary.uid in previous_y:
+            return (previous_y[boundary.uid], boundary.uid)
+        if boundary.proxy_layout:
+            return (float(boundary.proxy_layout.get("y", 0.0)), boundary.uid)
+        return (1e9, boundary.linked_port_uid or boundary.uid)
+
     def sync_boundary_ports(self) -> None:
         """Rebuild boundary port items from group metadata."""
+        previous_y = {
+            uid: float(item.pos().y())
+            for uid, item in self.boundary_port_items.items()
+        }
         for item in list(self.boundary_port_items.values()):
             item.setParentItem(None)
         self.boundary_port_items.clear()
 
         border_ports = self._border_boundary_ports()
-        inputs = [p for p in border_ports if p.direction == "input"]
-        outputs = [p for p in border_ports if p.direction == "output"]
+        inputs = sorted(
+            [p for p in border_ports if p.direction == "input"],
+            key=lambda boundary: self._border_sort_key(boundary, previous_y),
+        )
+        outputs = sorted(
+            [p for p in border_ports if p.direction == "output"],
+            key=lambda boundary: self._border_sort_key(boundary, previous_y),
+        )
         rect = self.rect()
 
         for index, boundary in enumerate(inputs):
