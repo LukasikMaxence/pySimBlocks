@@ -432,6 +432,8 @@ class ProjectController(QObject):
             )
 
         if boundary_port is not None:
+            if self._wire_child_border_to_parent_member(boundary_port, member_port):
+                return True
             group_uid = boundary_port.parent_group.group.uid
             boundary_uid = boundary_port.boundary.uid
             if self._wire_auto_boundary_external(
@@ -444,6 +446,37 @@ class ProjectController(QObject):
                 member_port,
             )
         return False
+
+    def _wire_child_border_to_parent_member(
+        self,
+        boundary_port,
+        member_port: PortInstance,
+    ) -> bool:
+        """Wire a child-group border port to a direct member of the active parent."""
+        active_uid = self.view.current_view_group_uid
+        if active_uid is None:
+            return False
+        child_group = boundary_port.parent_group.group
+        parent = self.project_state.get_visual_group(active_uid)
+        if parent is None or child_group.parent_uid != parent.uid:
+            return False
+        if member_port.block.uid not in parent.members:
+            return False
+        boundary = boundary_port.boundary
+        internal = find_port(self.project_state, boundary.linked_port_uid)
+        if internal is None:
+            return False
+        if boundary.direction == "input":
+            src_port, dst_port = member_port, internal
+        else:
+            src_port, dst_port = internal, member_port
+        if not src_port.is_compatible(dst_port):
+            return False
+        dst_connections = self.project_state.get_connections_of_port(dst_port)
+        if not dst_port.can_accept_connection(dst_connections):
+            return False
+        self.undo_manager.push(AddConnectionCommand(self, src_port, dst_port, None))
+        return True
 
     def _wire_group_boundaries_together(
         self,
