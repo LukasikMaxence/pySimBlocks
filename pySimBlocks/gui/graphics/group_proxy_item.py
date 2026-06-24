@@ -29,11 +29,17 @@ class GroupProxyPortItem(QGraphicsItem):
         self.is_output = is_output
         self.parent_proxy = parent_proxy
 
+    @property
+    def is_on_left_side(self) -> bool:
+        return self.pos().x() < (self.parent_proxy.rect().width() * 0.5)
+
     def connection_anchor(self) -> QPointF:
         if self.is_output:
-            local = QPointF(self.L, 0)
+            x = self.L if not self.is_on_left_side else -self.L
+            local = QPointF(x, 0)
         else:
-            local = QPointF(-self.R, 0)
+            x = -self.R if self.is_on_left_side else self.R
+            local = QPointF(x, 0)
         return self.mapToScene(local)
 
     def boundingRect(self) -> QRectF:
@@ -42,9 +48,10 @@ class GroupProxyPortItem(QGraphicsItem):
     def shape(self):
         path = QPainterPath()
         if self.is_output:
+            tip_x = self.L if not self.is_on_left_side else -self.L
             path.moveTo(0, -self.H)
             path.lineTo(0, self.H)
-            path.lineTo(self.L, 0)
+            path.lineTo(tip_x, 0)
             path.closeSubpath()
         else:
             path.addEllipse(-self.R, -self.R, 2 * self.R, 2 * self.R)
@@ -67,7 +74,8 @@ class GroupProxyPortItem(QGraphicsItem):
             path = QPainterPath()
             path.moveTo(0, -self.H)
             path.lineTo(0, self.H)
-            path.lineTo(self.L, 0)
+            tip_x = self.L if not self.is_on_left_side else -self.L
+            path.lineTo(tip_x, 0)
             path.closeSubpath()
             painter.drawPath(path)
         else:
@@ -92,17 +100,17 @@ class GroupProxyItem(QGraphicsRectItem):
         super().__init__(0, 0, self.WIDTH, self.HEIGHT)
         self.boundary = boundary
         self.view = view
-        rect = self.rect()
-        mid_y = rect.height() / 2
+        layout = boundary.proxy_layout or {}
+        self.orientation = layout.get("orientation", "normal")
+        if self.orientation not in {"normal", "flipped"}:
+            self.orientation = "normal"
 
         if self.is_group_in:
             self.port_item = GroupProxyPortItem(is_output=True, parent_proxy=self)
-            self.port_item.setPos(rect.width(), mid_y)
         else:
             self.port_item = GroupProxyPortItem(is_output=False, parent_proxy=self)
-            self.port_item.setPos(0, mid_y)
+        self._layout_port()
 
-        layout = boundary.proxy_layout or {}
         self.setPos(QPointF(float(layout.get("x", 0.0)), float(layout.get("y", 0.0))))
         self.setFlag(QGraphicsRectItem.ItemIsMovable)
         self.setFlag(QGraphicsRectItem.ItemIsSelectable)
@@ -133,6 +141,29 @@ class GroupProxyItem(QGraphicsRectItem):
     def member_anchor(self) -> QPointF:
         """Anchor used for wires between the proxy and group members."""
         return self.port_item.connection_anchor()
+
+    def _layout_port(self) -> None:
+        rect = self.rect()
+        mid_y = rect.height() / 2
+        flipped = self.orientation == "flipped"
+        if self.is_group_in:
+            self.port_item.setPos(0 if flipped else rect.width(), mid_y)
+        else:
+            self.port_item.setPos(rect.width() if flipped else 0, mid_y)
+
+    def set_orientation(self, orientation: str) -> None:
+        if orientation not in {"normal", "flipped"}:
+            return
+        self.orientation = orientation
+        self._layout_port()
+        layout = dict(self.boundary.proxy_layout or {})
+        layout["orientation"] = orientation
+        self.boundary.proxy_layout = layout
+        for conn_item in self.view.connections.values():
+            if conn_item.is_manual:
+                conn_item.invalidate_manual_route()
+        self.view.on_proxy_moved(self)
+        self.update()
 
     def paint(self, painter, option, widget=None):
         t = self.view.theme
@@ -204,10 +235,11 @@ class GroupProxyItem(QGraphicsRectItem):
 
         if change == QGraphicsItem.ItemPositionHasChanged and self.view.project_controller:
             pos = self.pos()
-            self.boundary.proxy_layout = {
-                "x": float(pos.x()),
-                "y": float(pos.y()),
-            }
+            layout = dict(self.boundary.proxy_layout or {})
+            layout["x"] = float(pos.x())
+            layout["y"] = float(pos.y())
+            layout["orientation"] = self.orientation
+            self.boundary.proxy_layout = layout
             self.view.on_proxy_moved(self)
 
         return super().itemChange(change, value)

@@ -314,8 +314,8 @@ class ConnectionItem(QGraphicsPathItem):
         src_rect = self._routing_rect_for_port(self.src_port)
         dst_rect = self._routing_rect_for_port(self.dst_port)
 
-        src_out_sign = 1 if not self.src_port.is_on_left_side else -1
-        dst_in_sign = -1 if self.dst_port.is_on_left_side else 1
+        src_out_sign = self._wire_side_sign(p1, src_rect)
+        dst_in_sign = self._wire_side_sign(p2, dst_rect)
 
         p1_out = QPointF(p1.x() + src_out_sign * self.OFFSET, p1.y())
         p2_in = QPointF(p2.x() + dst_in_sign * self.OFFSET, p2.y())
@@ -362,6 +362,23 @@ class ConnectionItem(QGraphicsPathItem):
             key=lambda y: abs(p1.y() - y) + abs(p2.y() - y)
         )
 
+        if src_rect.left() <= p2_in.x() <= src_rect.right():
+            approach_x = (
+                src_rect.left() - self.DETOUR
+                if dst_in_sign < 0
+                else src_rect.right() + self.DETOUR
+            )
+            return self._simplify_orthogonal_route(
+                [
+                    p1,
+                    p1_out,
+                    QPointF(p1_out.x(), route_y),
+                    QPointF(approach_x, route_y),
+                    QPointF(approach_x, p2.y()),
+                    p2,
+                ]
+            )
+
         return self._simplify_orthogonal_route(
             [
                 p1, p1_out,
@@ -371,20 +388,16 @@ class ConnectionItem(QGraphicsPathItem):
             ]
         )
 
+    def _wire_side_sign(self, anchor: QPointF, rect: QRectF) -> int:
+        """Return -1 when the anchor is on the left edge, +1 on the right."""
+        dist_left = abs(anchor.x() - rect.left())
+        dist_right = abs(anchor.x() - rect.right())
+        return -1 if dist_left <= dist_right else 1
+
     def _routing_rect_for_port(self, port_item: PortItem) -> QRectF:
         """Return the scene rectangle used for obstacle avoidance."""
-        block_item = port_item.parent_block
-        view = block_item.view
-        block_uid = port_item.instance.block.uid
-
-        if view.current_view_group_uid is None:
-            for group_item in view.group_items.values():
-                if not group_item.isVisible():
-                    continue
-                if block_uid in group_item.group.members:
-                    return group_item.mapRectToScene(group_item.rect())
-
-        return block_item.mapRectToScene(block_item.rect())
+        view = port_item.parent_block.view
+        return view.routing_rect_for_port_item(port_item)
 
     def _wire_length(self, points: list[QPointF]) -> float:
         total = 0.0

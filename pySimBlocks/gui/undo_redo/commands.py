@@ -196,6 +196,52 @@ class ToggleOrientationCommand(QUndoCommand):
         self._controller.make_dirty()
 
 
+class ToggleGroupOrientationCommand(QUndoCommand):
+    def __init__(self, controller, group_uid: str, old_orientation: str, new_orientation: str):
+        super().__init__("Flip Group")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._old_orientation = old_orientation
+        self._new_orientation = new_orientation
+
+    def redo(self) -> None:
+        self._controller._set_group_orientation(self._group_uid, self._new_orientation)
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._set_group_orientation(self._group_uid, self._old_orientation)
+        self._controller.make_dirty()
+
+
+class ToggleProxyOrientationCommand(QUndoCommand):
+    def __init__(
+        self,
+        controller,
+        group_uid: str,
+        boundary_uid: str,
+        old_orientation: str,
+        new_orientation: str,
+    ):
+        super().__init__("Flip Proxy")
+        self._controller = controller
+        self._group_uid = group_uid
+        self._boundary_uid = boundary_uid
+        self._old_orientation = old_orientation
+        self._new_orientation = new_orientation
+
+    def redo(self) -> None:
+        self._controller._set_proxy_orientation(
+            self._group_uid, self._boundary_uid, self._new_orientation
+        )
+        self._controller.make_dirty()
+
+    def undo(self) -> None:
+        self._controller._set_proxy_orientation(
+            self._group_uid, self._boundary_uid, self._old_orientation
+        )
+        self._controller.make_dirty()
+
+
 class GroupBlocksCommand(QUndoCommand):
     def __init__(
         self,

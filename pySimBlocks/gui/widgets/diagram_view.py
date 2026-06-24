@@ -298,6 +298,9 @@ class DiagramView(QGraphicsView):
             else:
                 item.group = group
                 if group.layout:
+                    orientation = group.layout.get("orientation", "normal")
+                    if orientation in {"normal", "flipped"}:
+                        item.orientation = orientation
                     item.apply_geometry(
                         QPointF(
                             float(group.layout.get("x", 0.0)),
@@ -491,12 +494,16 @@ class DiagramView(QGraphicsView):
             else:
                 item.boundary = boundary
                 if boundary.proxy_layout:
+                    orientation = boundary.proxy_layout.get("orientation", "normal")
+                    if orientation in {"normal", "flipped"}:
+                        item.orientation = orientation
                     item.setPos(
                         QPointF(
                             float(boundary.proxy_layout.get("x", 0.0)),
                             float(boundary.proxy_layout.get("y", 0.0)),
                         )
                     )
+                    item._layout_port()
             item.setVisible(True)
 
     def _child_group_uid_for_block(self, parent_group, block_uid: str) -> str | None:
@@ -603,6 +610,45 @@ class DiagramView(QGraphicsView):
                 return anchor
 
         return port_item.connection_anchor()
+
+    def proxy_item_for_port_item(self, port_item: PortItem) -> GroupProxyItem | None:
+        """Return the proxy that currently owns a port's routed anchor."""
+        redirected = self.connection_anchor_for_port_item(port_item)
+        direct = port_item.connection_anchor()
+        if (
+            abs(redirected.x() - direct.x()) < 0.5
+            and abs(redirected.y() - direct.y()) < 0.5
+        ):
+            return None
+        for proxy in self.proxy_items.values():
+            if not proxy.isVisible():
+                continue
+            anchor = proxy.member_anchor()
+            if (
+                abs(anchor.x() - redirected.x()) < 0.5
+                and abs(anchor.y() - redirected.y()) < 0.5
+            ):
+                return proxy
+        return None
+
+    def routing_rect_for_port_item(self, port_item: PortItem) -> QRectF:
+        """Return the obstacle rectangle used when routing wires to a port."""
+        proxy = self.proxy_item_for_port_item(port_item)
+        if proxy is not None:
+            return proxy.mapRectToScene(proxy.rect())
+
+        block_item = port_item.parent_block
+        block_uid = port_item.instance.block.uid
+        if self.project_controller is not None and self.current_view_group_uid is None:
+            exposing = self.project_controller._group_exposing_boundary_for_block(
+                block_uid, self.current_view_group_uid
+            )
+            if exposing is not None:
+                group_item = self.group_items.get(exposing.uid)
+                if group_item is not None and group_item.isVisible():
+                    return group_item.mapRectToScene(group_item.rect())
+
+        return block_item.mapRectToScene(block_item.rect())
 
     def _manual_proxy_anchor_for_member_port(self, group, port_item: PortItem) -> QPointF | None:
         """Route member ports to a proxy while the boundary is incomplete."""
@@ -896,13 +942,38 @@ class DiagramView(QGraphicsView):
             event.accept()
             return
 
-        # ROTATE BLOCK
+        # ROTATE BLOCK / GROUP / PROXY
         if event.key() == Qt.Key_R and event.modifiers() & Qt.ControlModifier:
-            selected = [i for i in self.diagram_scene.selectedItems()
-                        if isinstance(i, BlockItem)]
-            for item in selected:
+            selected_blocks = [
+                i for i in self.diagram_scene.selectedItems() if isinstance(i, BlockItem)
+            ]
+            selected_groups = [
+                i for i in self.diagram_scene.selectedItems() if isinstance(i, GroupItem)
+            ]
+            selected_proxies: list[GroupProxyItem] = []
+            seen_proxy_uids: set[str] = set()
+            for item in self.diagram_scene.selectedItems():
+                if isinstance(item, GroupProxyPortItem):
+                    item = item.parent_proxy
+                if not isinstance(item, GroupProxyItem):
+                    continue
+                if item.boundary.uid in seen_proxy_uids:
+                    continue
+                seen_proxy_uids.add(item.boundary.uid)
+                selected_proxies.append(item)
+            for item in selected_blocks:
                 self.project_controller.execute_toggle_orientation(item.instance)
-            return
+            for item in selected_groups:
+                self.project_controller.execute_toggle_group_orientation(item.group.uid)
+            if self.current_view_group_uid is not None:
+                for item in selected_proxies:
+                    self.project_controller.execute_toggle_proxy_orientation(
+                        self.current_view_group_uid,
+                        item.boundary.uid,
+                    )
+            if selected_blocks or selected_groups or selected_proxies:
+                event.accept()
+                return
 
         # CENTER VIEW
         if event.key() == Qt.Key_Space and not event.modifiers():

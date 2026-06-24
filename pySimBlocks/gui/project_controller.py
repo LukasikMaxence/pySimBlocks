@@ -82,6 +82,8 @@ from pySimBlocks.gui.undo_redo.commands import (
     RenameGroupCommand,
     PasteClipboardCommand,
     ToggleOrientationCommand,
+    ToggleGroupOrientationCommand,
+    ToggleProxyOrientationCommand,
     UngroupCommand,
     DeleteGroupCommand,
     WireManualBoundaryCommand,
@@ -1089,6 +1091,28 @@ class ProjectController(QObject):
             ToggleOrientationCommand(self, block_instance.uid, old_orientation, new_orientation)
         )
 
+    def execute_toggle_group_orientation(self, group_uid: str) -> None:
+        group_item = self.view.group_items.get(group_uid)
+        if group_item is None:
+            return
+        old_orientation = group_item.orientation
+        new_orientation = "flipped" if old_orientation == "normal" else "normal"
+        self.undo_manager.push(
+            ToggleGroupOrientationCommand(self, group_uid, old_orientation, new_orientation)
+        )
+
+    def execute_toggle_proxy_orientation(self, group_uid: str, boundary_uid: str) -> None:
+        proxy_item = self.view.proxy_items.get(boundary_uid)
+        if proxy_item is None:
+            return
+        old_orientation = proxy_item.orientation
+        new_orientation = "flipped" if old_orientation == "normal" else "normal"
+        self.undo_manager.push(
+            ToggleProxyOrientationCommand(
+                self, group_uid, boundary_uid, old_orientation, new_orientation
+            )
+        )
+
     def execute_edit_connection_route(
         self,
         connection: ConnectionInstance,
@@ -1611,15 +1635,31 @@ class ProjectController(QObject):
             return
         group_item = self.view.group_items.get(group_uid)
         if group_item is None:
-            group.layout = {
+            layout = dict(group.layout or {})
+            layout.update({
                 "x": float(pos.x()),
                 "y": float(pos.y()),
                 "width": float(rect.width()),
                 "height": float(rect.height()),
-            }
+            })
+            group.layout = layout
             return
         group_item.apply_geometry(pos, rect)
         self.view.on_group_moved(group_item)
+
+    def _set_group_orientation(self, group_uid: str, orientation: str) -> None:
+        group_item = self.view.group_items.get(group_uid)
+        if group_item is None:
+            return
+        group_item.set_orientation(orientation)
+
+    def _set_proxy_orientation(
+        self, group_uid: str, boundary_uid: str, orientation: str
+    ) -> None:
+        proxy_item = self.view.proxy_items.get(boundary_uid)
+        if proxy_item is None:
+            return
+        proxy_item.set_orientation(orientation)
 
     def _set_block_geometry(self, block_uid: str, pos: QPointF, rect: QRectF) -> None:
         block = self._find_block_by_uid(block_uid)
@@ -2060,7 +2100,11 @@ class ProjectController(QObject):
             if item is None:
                 continue
             pos = item.pos()
-            boundary.proxy_layout = {"x": float(pos.x()), "y": float(pos.y())}
+            boundary.proxy_layout = {
+                "x": float(pos.x()),
+                "y": float(pos.y()),
+                "orientation": item.orientation,
+            }
 
     def _add_manual_boundary_port(
         self,
@@ -2130,7 +2174,10 @@ class ProjectController(QObject):
         )
         if boundary is None:
             return
-        boundary.proxy_layout = {"x": float(pos.x()), "y": float(pos.y())}
+        layout = dict(boundary.proxy_layout or {})
+        layout["x"] = float(pos.x())
+        layout["y"] = float(pos.y())
+        boundary.proxy_layout = layout
         proxy_item = self.view.proxy_items.get(boundary_uid)
         if proxy_item is not None:
             proxy_item.setPos(QPointF(pos))

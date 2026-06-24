@@ -42,11 +42,17 @@ class GroupBoundaryPortItem(QGraphicsItem):
     def is_input(self) -> bool:
         return self.boundary.direction == "input"
 
+    @property
+    def is_on_left_side(self) -> bool:
+        return self.pos().x() < (self.parent_group.rect().width() * 0.5)
+
     def connection_anchor(self) -> QPointF:
         if self.is_input:
-            local = QPointF(-self.R, 0)
+            x = -self.R if self.is_on_left_side else self.R
+            local = QPointF(x, 0)
         else:
-            local = QPointF(self.L, 0)
+            x = self.L if not self.is_on_left_side else -self.L
+            local = QPointF(x, 0)
         return self.mapToScene(local)
 
     def update_port_label(self) -> None:
@@ -64,7 +70,7 @@ class GroupBoundaryPortItem(QGraphicsItem):
 
     def _layout_port_label(self) -> None:
         label_rect = self.label.boundingRect()
-        if self.is_input:
+        if self.is_on_left_side:
             self.label.setPos(
                 self.R + self.MARGIN,
                 -label_rect.height() / 2,
@@ -95,9 +101,10 @@ class GroupBoundaryPortItem(QGraphicsItem):
         if self.is_input:
             path.addEllipse(-self.R, -self.R, 2 * self.R, 2 * self.R)
         else:
+            tip_x = self.L if not self.is_on_left_side else -self.L
             path.moveTo(0, -self.H)
             path.lineTo(0, self.H)
-            path.lineTo(self.L, 0)
+            path.lineTo(tip_x, 0)
             path.closeSubpath()
         return path
 
@@ -115,7 +122,8 @@ class GroupBoundaryPortItem(QGraphicsItem):
             path = QPainterPath()
             path.moveTo(0, -self.H)
             path.lineTo(0, self.H)
-            path.lineTo(self.L, 0)
+            tip_x = self.L if not self.is_on_left_side else -self.L
+            path.lineTo(tip_x, 0)
             path.closeSubpath()
             painter.drawPath(path)
 
@@ -137,6 +145,9 @@ class GroupItem(QGraphicsRectItem):
         super().__init__(0, 0, width, height)
         self.group = group
         self.view = view
+        self.orientation = layout.get("orientation", "normal")
+        if self.orientation not in {"normal", "flipped"}:
+            self.orientation = "normal"
         self.boundary_port_items: dict[str, GroupBoundaryPortItem] = {}
         self._resize_handle: str | None = None
         self._resize_start_mouse: QPointF | None = None
@@ -195,10 +206,19 @@ class GroupItem(QGraphicsRectItem):
         index = same_direction.index(boundary) if boundary in same_direction else 0
         total = len(same_direction)
         y = rect.height() * (index + 1) / (total + 1)
+        flipped = self.orientation == "flipped"
         if boundary.direction == "input":
-            local = QPointF(-GroupBoundaryPortItem.R, y)
+            local = (
+                QPointF(rect.width() + GroupBoundaryPortItem.R, y)
+                if flipped
+                else QPointF(-GroupBoundaryPortItem.R, y)
+            )
         else:
-            local = QPointF(rect.width() + GroupBoundaryPortItem.L, y)
+            local = (
+                QPointF(-GroupBoundaryPortItem.L, y)
+                if flipped
+                else QPointF(rect.width() + GroupBoundaryPortItem.L, y)
+            )
         return self.mapToScene(local)
 
     def _border_sort_key(
@@ -233,20 +253,42 @@ class GroupItem(QGraphicsRectItem):
             key=lambda boundary: self._border_sort_key(boundary, previous_y),
         )
         rect = self.rect()
+        flipped = self.orientation == "flipped"
+        width = rect.width()
 
         for index, boundary in enumerate(inputs):
             item = GroupBoundaryPortItem(boundary, self)
             y = rect.height() * (index + 1) / (len(inputs) + 1)
-            item.setPos(0, y)
+            item.setPos(width if flipped else 0, y)
             item.update_port_label()
             self.boundary_port_items[boundary.uid] = item
 
         for index, boundary in enumerate(outputs):
             item = GroupBoundaryPortItem(boundary, self)
             y = rect.height() * (index + 1) / (len(outputs) + 1)
-            item.setPos(rect.width(), y)
+            item.setPos(0 if flipped else width, y)
             item.update_port_label()
             self.boundary_port_items[boundary.uid] = item
+
+    def set_orientation(self, orientation: str) -> None:
+        if orientation not in {"normal", "flipped"}:
+            return
+        self.orientation = orientation
+        self.sync_boundary_ports()
+        layout = dict(self.group.layout or {})
+        layout["orientation"] = orientation
+        self.group.layout = layout
+        members = set(
+            self.view.project_controller._group_content_uids_for_group(self.group)
+        )
+        for conn_inst, conn_item in self.view.connections.items():
+            if (
+                conn_inst.src_block().uid in members
+                or conn_inst.dst_block().uid in members
+            ) and conn_item.is_manual:
+                conn_item.invalidate_manual_route()
+        self.view.on_group_moved(self)
+        self.update()
 
     def refresh_boundary_port_labels(self) -> None:
         """Update external port labels after diagram connections change."""
@@ -412,6 +454,7 @@ class GroupItem(QGraphicsRectItem):
             "y": float(pos.y()),
             "width": float(rect.width()),
             "height": float(rect.height()),
+            "orientation": self.orientation,
         }
 
     def mouseDoubleClickEvent(self, event):
