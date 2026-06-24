@@ -755,6 +755,8 @@ class DiagramView(QGraphicsView):
         """Refresh wires after a group container is moved."""
         for conn_inst, conn_item in self.connections.items():
             conn_item.update_position()
+        for wire in self.manual_boundary_wires.values():
+            wire.update_position()
 
     def get_block_item_from_instance(self, block_instance: BlockInstance) -> BlockItem | None:
         """Return the visual BlockItem for the given block instance, or None.
