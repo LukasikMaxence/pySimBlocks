@@ -365,8 +365,6 @@ class DiagramView(QGraphicsView):
             for boundary in group.boundary_ports:
                 if boundary.linked_connection_uid:
                     continue
-                if boundary.origin != "manual":
-                    continue
                 if not boundary.linked_port_uid:
                     continue
                 if not self._proxy_applies_to_active_group(group, boundary):
@@ -420,7 +418,7 @@ class DiagramView(QGraphicsView):
             if group_item is None or not group_item.isVisible():
                 continue
             for boundary in group.boundary_ports:
-                if boundary.origin != "manual" or boundary.linked_connection_uid:
+                if boundary.linked_connection_uid:
                     continue
                 if not boundary.external_port_uid:
                     continue

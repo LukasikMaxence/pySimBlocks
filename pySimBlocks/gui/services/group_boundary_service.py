@@ -98,8 +98,10 @@ def validate_external_link(
     boundary: BoundaryPort,
     external_port: PortInstance,
 ) -> bool:
-    """Return whether an external port may be wired to a manual group border port."""
-    if not is_manual(boundary):
+    """Return whether an external port may be wired to a group border port."""
+    if is_complete(boundary):
+        return False
+    if boundary.origin not in ("manual", "auto"):
         return False
     if external_port.block.uid in group.members:
         return False
@@ -125,7 +127,9 @@ def connection_endpoints(
 
 
 def can_complete(state: ProjectState, boundary: BoundaryPort) -> bool:
-    if not is_manual(boundary) or is_complete(boundary):
+    if is_complete(boundary):
+        return False
+    if boundary.origin not in ("manual", "auto"):
         return False
     if not boundary.linked_port_uid or not boundary.external_port_uid:
         return False
