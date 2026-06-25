@@ -986,6 +986,16 @@ class PlotDialog(QDialog):
         self._axis_to_panel_key[id(ax)] = key
         self._highlight_manual_axis(ax, key == f"manual::{self._manual.active}")
 
+    @staticmethod
+    def _manual_panel_index_from_key(key: str) -> int:
+        """Return manual panel index encoded in a preview panel key."""
+        if key.startswith("manual::"):
+            try:
+                return int(key.split("::", 1)[1])
+            except ValueError:
+                pass
+        return 0
+
     def _render_manual_plots_preview(self) -> None:
         """Render all manual plot panels in a 2-column grid (last odd spans full width)."""
         self._refresh_subplot_filter([], keep_current=False)
@@ -1026,7 +1036,8 @@ class PlotDialog(QDialog):
         if len(panels) == 1:
             title, key, series = panels[0]
             ax = self.figure.add_subplot(111)
-            self._draw_manual_panel(ax, time, title, key, series, 0)
+            panel_idx = self._manual_panel_index_from_key(key)
+            self._draw_manual_panel(ax, time, title, key, series, panel_idx)
             self._finalize_layout()
             return
 
@@ -1037,7 +1048,8 @@ class PlotDialog(QDialog):
                 ax = self.figure.add_subplot(gs[i // 2, :])
             else:
                 ax = self.figure.add_subplot(gs[i // 2, i % 2])
-            self._draw_manual_panel(ax, time, title, key, series, i)
+            panel_idx = self._manual_panel_index_from_key(key)
+            self._draw_manual_panel(ax, time, title, key, series, panel_idx)
         self._finalize_layout()
 
     def _highlight_manual_axis(self, ax, selected: bool) -> None:
