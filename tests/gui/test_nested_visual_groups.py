@@ -309,3 +309,44 @@ def test_undo_connection_delete_does_not_duplicate_output_proxy(qtbot, tmp_path)
         if proxy.isVisible() and proxy.boundary.direction == "output"
     ]
     assert len(visible_outputs) == 1
+
+
+def test_manual_route_recomputed_when_entering_control_loop_from_root(qtbot, tmp_path):
+    import shutil
+    from pathlib import Path
+
+    example_dir = (
+        Path(__file__).resolve().parents[2] / "examples/basics/nested_groups/gui"
+    )
+    project_dir = tmp_path / "nested"
+    shutil.copytree(example_dir, project_dir)
+
+    window = _create_window(qtbot, project_dir)
+    controller = window.project_controller
+    view = window.view
+
+    control_loop_uid = "3729168ddf894f62a7b4f1633b4b3014"
+    controller_uid = "3643a75d10754f21afb56a8a24844cdb"
+    sum_plant_uid = "db6d7d946a14478fa5fed05018e0a64a"
+
+    connection = next(
+        conn
+        for conn in controller.project_state.connections
+        if conn.src_block().uid == controller_uid
+        and conn.src_port.name == "u"
+        and conn.dst_block().uid == sum_plant_uid
+        and conn.dst_port.name == "in1"
+    )
+    conn_item = view.connections[connection]
+    conn_item.update_position()
+    manual_points = [QPointF(point) for point in conn_item.route.points]
+    manual_points.insert(2, QPointF(manual_points[1].x() + 350.0, manual_points[1].y() + 200.0))
+    conn_item.apply_manual_route(manual_points)
+    absurd_length = _wire_length(conn_item.route.points)
+
+    view.enter_group(control_loop_uid)
+    view.refresh_visual_groups()
+    conn_item.update_position()
+
+    assert not conn_item.is_manual
+    assert _wire_length(conn_item.route.points) < absurd_length * 0.5

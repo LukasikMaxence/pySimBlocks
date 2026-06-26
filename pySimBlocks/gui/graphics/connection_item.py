@@ -112,6 +112,7 @@ class ConnectionItem(QGraphicsPathItem):
         self._route_points_before_drag: list[QPointF] | None = None
         self._manual_src_redirected: bool | None = None
         self._manual_dst_redirected: bool | None = None
+        self._manual_view_group_uid: str | None = None
 
         if points and len(points) >= 2:
             self.apply_manual_route(points)
@@ -165,6 +166,7 @@ class ConnectionItem(QGraphicsPathItem):
         self.is_manual = False
         self._manual_src_redirected = None
         self._manual_dst_redirected = None
+        self._manual_view_group_uid = None
         self._apply_route(self.route.points)
 
     def update_temp_position(self, scene_pos: QPointF):
@@ -193,6 +195,7 @@ class ConnectionItem(QGraphicsPathItem):
         self.route = None
         self._manual_src_redirected = None
         self._manual_dst_redirected = None
+        self._manual_view_group_uid = None
 
     def segment_at(self, scene_pos: QPointF) -> int | None:
         """Return the route segment index located near the given scene point.
@@ -325,12 +328,17 @@ class ConnectionItem(QGraphicsPathItem):
         )
 
     def _capture_manual_anchor_context(self) -> None:
-        """Remember whether each endpoint used a redirected anchor when the route was edited."""
+        """Remember view level and anchor redirection when the route was edited."""
+        view = self.src_port.parent_block.view
+        self._manual_view_group_uid = view.current_view_group_uid
         self._manual_src_redirected = self._anchor_redirected(self.src_port)
         self._manual_dst_redirected = self._anchor_redirected(self.dst_port)
 
     def _manual_anchor_context_matches(self) -> bool:
-        """Return whether the current view still uses the same anchor redirection as when edited."""
+        """Return whether the current view matches the one used when the route was edited."""
+        view = self.src_port.parent_block.view
+        if view.current_view_group_uid != self._manual_view_group_uid:
+            return False
         src_redirected = self._anchor_redirected(self.src_port)
         dst_redirected = self._anchor_redirected(self.dst_port)
         if self._manual_src_redirected is None or self._manual_dst_redirected is None:
