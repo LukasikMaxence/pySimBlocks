@@ -1516,7 +1516,6 @@ class ProjectController(QObject):
                     if not boundary.external_port_uid:
                         boundary.external_port_uid = external_key
             else:
-                boundary.origin = "manual"
                 boundary.linked_connection_uid = ""
                 if deleting_inside:
                     boundary.external_port_uid = external_key
@@ -1597,7 +1596,12 @@ class ProjectController(QObject):
             points=points,
         )
 
-    def _add_connection_from_snapshot(self, snapshot: ConnectionSnapshot) -> ConnectionInstance | None:
+    def _add_connection_from_snapshot(
+        self,
+        snapshot: ConnectionSnapshot,
+        *,
+        refresh_boundaries: bool = True,
+    ) -> ConnectionInstance | None:
         src_port = self._find_port(snapshot.src_block_uid, snapshot.src_port_name)
         dst_port = self._find_port(snapshot.dst_block_uid, snapshot.dst_port_name)
         if src_port is None or dst_port is None:
@@ -1609,9 +1613,10 @@ class ProjectController(QObject):
         connection_instance = ConnectionInstance(src_port, dst_port)
         self.project_state.add_connection(connection_instance)
         self.view.add_connection(connection_instance, snapshot.points)
-        self._refresh_boundaries_for_member_uids(
-            {src_port.block.uid, dst_port.block.uid}
-        )
+        if refresh_boundaries:
+            self._refresh_boundaries_for_member_uids(
+                {src_port.block.uid, dst_port.block.uid}
+            )
         return connection_instance
 
     def _set_group_geometry(self, group_uid: str, pos: QPointF, rect: QRectF) -> None:
@@ -2429,6 +2434,11 @@ class ProjectController(QObject):
             rebuilt_auto.append(port)
 
         rebuilt_keys = {port.linked_port_uid for port in rebuilt_auto}
+        rebuilt_connection_keys = {
+            port.linked_connection_uid
+            for port in rebuilt_auto
+            if port.linked_connection_uid
+        }
         for port in group.boundary_ports:
             if port.origin != "auto":
                 continue
@@ -2439,6 +2449,15 @@ class ProjectController(QObject):
             if port.linked_port_uid in manual_member_keys:
                 continue
             if port.linked_port_uid and port.linked_port_uid in rebuilt_keys:
+                continue
+            if (
+                not port.linked_port_uid
+                and port.external_port_uid
+                and any(
+                    port.external_port_uid.split(":", 1)[0] in key
+                    for key in rebuilt_connection_keys
+                )
+            ):
                 continue
             rebuilt_auto.append(port)
 

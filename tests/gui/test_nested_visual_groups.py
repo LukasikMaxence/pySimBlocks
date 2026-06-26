@@ -259,3 +259,53 @@ def test_manual_route_recomputed_in_nested_group_view(qtbot, tmp_path):
 
     assert not conn_item.is_manual
     assert _wire_length(conn_item.route.points) < absurd_length * 0.5
+
+
+def test_undo_connection_delete_does_not_duplicate_output_proxy(qtbot, tmp_path):
+    import shutil
+    from pathlib import Path
+
+    example_dir = (
+        Path(__file__).resolve().parents[2] / "examples/basics/nested_groups/gui"
+    )
+    project_dir = tmp_path / "nested"
+    shutil.copytree(example_dir, project_dir)
+
+    window = _create_window(qtbot, project_dir)
+    controller = window.project_controller
+    view = window.view
+
+    control_loop_uid = "3729168ddf894f62a7b4f1633b4b3014"
+    system_uid = "3f552e25cb9647bba4ce08cf897de600"
+    monitor_uid = "5417b603712a41db8d3ef5d0df87b393"
+
+    connection = next(
+        conn
+        for conn in controller.project_state.connections
+        if conn.src_block().uid == system_uid
+        and conn.src_port.name == "y"
+        and conn.dst_block().uid == monitor_uid
+    )
+
+    view.enter_group(control_loop_uid)
+    controller.remove_connection(connection)
+
+    control_loop = controller.project_state.get_visual_group(control_loop_uid)
+    assert control_loop is not None
+
+    window.undo_manager.stack.undo()
+
+    output_boundaries = [
+        port for port in control_loop.boundary_ports if port.direction == "output"
+    ]
+    assert len(output_boundaries) == 1
+    assert output_boundaries[0].linked_connection_uid
+    assert len(controller.project_state.connections) == 9
+
+    view.refresh_visual_groups()
+    visible_outputs = [
+        boundary_uid
+        for boundary_uid, proxy in view.proxy_items.items()
+        if proxy.isVisible() and proxy.boundary.direction == "output"
+    ]
+    assert len(visible_outputs) == 1
