@@ -1,3 +1,5 @@
+from PySide6.QtCore import QPointF
+
 from pySimBlocks.gui.main_window import MainWindow
 
 
@@ -216,3 +218,44 @@ def test_delete_group_removes_nested_members_and_child_groups(qtbot, tmp_path):
     assert controller.project_state.get_visual_group(control_loop.uid) is not None
     for uid in member_uids:
         assert controller._find_block_by_uid(uid) is not None
+
+
+def _wire_length(points) -> float:
+    total = 0.0
+    for index in range(len(points) - 1):
+        a = points[index]
+        b = points[index + 1]
+        total += abs(a.x() - b.x()) + abs(a.y() - b.y())
+    return total
+
+
+def test_manual_route_recomputed_in_nested_group_view(qtbot, tmp_path):
+    window = _create_window(qtbot, tmp_path)
+    controller = window.project_controller
+    view = window.view
+
+    external = controller.add_block("sources", "constant")
+    inner_a = controller.add_block("operators", "sum")
+    inner_b = controller.add_block("controllers", "state_feedback")
+    controller.add_connection(_first_port(external, "output"), _first_port(inner_a, "input"))
+    inner = controller.group_blocks([inner_a, inner_b], name="Regulator")
+    controller.group_blocks(
+        [controller.add_block("operators", "gain")],
+        child_group_uids=[inner.uid],
+        name="ControlLoop",
+    )
+
+    connection = next(iter(controller.project_state.connections))
+    conn_item = view.connections[connection]
+    conn_item.update_position()
+    manual_points = [QPointF(point) for point in conn_item.route.points]
+    manual_points.insert(2, QPointF(manual_points[1].x() + 300.0, manual_points[1].y() + 250.0))
+    conn_item.apply_manual_route(manual_points)
+    absurd_length = _wire_length(conn_item.route.points)
+
+    view.enter_group(inner.uid)
+    view.refresh_visual_groups()
+    conn_item.update_position()
+
+    assert not conn_item.is_manual
+    assert _wire_length(conn_item.route.points) < absurd_length * 0.5

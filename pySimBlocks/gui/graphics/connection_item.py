@@ -110,6 +110,8 @@ class ConnectionItem(QGraphicsPathItem):
         self.route: OrthogonalRoute | None = None
         self._route_drag_active = False
         self._route_points_before_drag: list[QPointF] | None = None
+        self._manual_src_redirected: bool | None = None
+        self._manual_dst_redirected: bool | None = None
 
         if points and len(points) >= 2:
             self.apply_manual_route(points)
@@ -151,14 +153,18 @@ class ConnectionItem(QGraphicsPathItem):
             return
 
         if self.is_manual and self.route and len(self.route.points) >= 2:
-            self.route.points[0] = p1
-            self.route.points[-1] = p2
-            self._apply_route(self.route.points, simplify=False)
-            return
+            if self._manual_anchor_context_matches():
+                self.route.points[0] = p1
+                self.route.points[-1] = p2
+                self._apply_route(self.route.points, simplify=False)
+                return
+            self.is_manual = False
 
         pts = self._compute_auto_route(p1, p2)
         self.route = OrthogonalRoute(pts)
         self.is_manual = False
+        self._manual_src_redirected = None
+        self._manual_dst_redirected = None
         self._apply_route(self.route.points)
 
     def update_temp_position(self, scene_pos: QPointF):
@@ -178,12 +184,15 @@ class ConnectionItem(QGraphicsPathItem):
         """
         self.route = OrthogonalRoute(points)
         self.is_manual = True
+        self._capture_manual_anchor_context()
         self._apply_route(self.route.points)
 
     def invalidate_manual_route(self):
         """Discard any manual route so the next update recomputes it."""
         self.is_manual = False
         self.route = None
+        self._manual_src_redirected = None
+        self._manual_dst_redirected = None
 
     def segment_at(self, scene_pos: QPointF) -> int | None:
         """Return the route segment index located near the given scene point.
@@ -290,6 +299,7 @@ class ConnectionItem(QGraphicsPathItem):
         super().mouseReleaseEvent(event)
         if was_dragging and event.button() == Qt.LeftButton and self.route is not None:
             self._apply_route(self.route.points)
+            self._capture_manual_anchor_context()
             view = self.src_port.parent_block.view
             new_points = [QPointF(point) for point in self.route.points]
             view.on_connection_route_edited(
@@ -303,6 +313,32 @@ class ConnectionItem(QGraphicsPathItem):
     # --------------------------------------------------------------------------
     # Private Methods
     # --------------------------------------------------------------------------
+
+    def _anchor_redirected(self, port_item: PortItem) -> bool:
+        """Return whether the current view routes this port through a group border or proxy."""
+        view = port_item.parent_block.view
+        redirected = view.connection_anchor_for_port_item(port_item)
+        direct = port_item.connection_anchor()
+        return (
+            abs(redirected.x() - direct.x()) > 0.5
+            or abs(redirected.y() - direct.y()) > 0.5
+        )
+
+    def _capture_manual_anchor_context(self) -> None:
+        """Remember whether each endpoint used a redirected anchor when the route was edited."""
+        self._manual_src_redirected = self._anchor_redirected(self.src_port)
+        self._manual_dst_redirected = self._anchor_redirected(self.dst_port)
+
+    def _manual_anchor_context_matches(self) -> bool:
+        """Return whether the current view still uses the same anchor redirection as when edited."""
+        src_redirected = self._anchor_redirected(self.src_port)
+        dst_redirected = self._anchor_redirected(self.dst_port)
+        if self._manual_src_redirected is None or self._manual_dst_redirected is None:
+            return not src_redirected and not dst_redirected
+        return (
+            self._manual_src_redirected == src_redirected
+            and self._manual_dst_redirected == dst_redirected
+        )
 
     def _compute_auto_route(self, p1: QPointF, p2: QPointF) -> list[QPointF]:
         """Compute an orthogonal route between two port anchors."""
