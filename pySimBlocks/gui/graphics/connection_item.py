@@ -153,12 +153,7 @@ class ConnectionItem(QGraphicsPathItem):
         if self.is_manual and self.route and len(self.route.points) >= 2:
             self.route.points[0] = p1
             self.route.points[-1] = p2
-            self.route.points = self._simplify_orthogonal_route(self.route.points)
-            if self._route_is_stale(p1, p2, self.route.points):
-                pts = self._compute_auto_route(p1, p2)
-                self.route = OrthogonalRoute(pts)
-                self.is_manual = False
-            self._apply_route(self.route.points)
+            self._apply_route(self.route.points, simplify=False)
             return
 
         pts = self._compute_auto_route(p1, p2)
@@ -429,19 +424,6 @@ class ConnectionItem(QGraphicsPathItem):
             simplified.append(QPointF(current))
         simplified.append(QPointF(points[-1]))
         return simplified
-
-    def _route_is_stale(self, p1: QPointF, p2: QPointF, points: list[QPointF]) -> bool:
-        if len(points) < 2:
-            return True
-
-        for index in range(len(points) - 1):
-            if self._wire_length([points[index], points[index + 1]]) < self.AXIS_EPS:
-                return True
-
-        auto_points = self._compute_auto_route(p1, p2)
-        manual_len = self._wire_length(points)
-        auto_len = self._wire_length(auto_points)
-        return manual_len > auto_len * 1.35 + 30.0
 
     def _snap(self, v: float) -> float:
         """Snap a scalar coordinate to the routing grid."""
